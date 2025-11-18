@@ -6,25 +6,30 @@ namespace FileServer.Services
     {
         Task<FileListResponse> GetFileListAsync(string relativePath);
         Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath);
+        Task<FileInfoModel> GetFileInfoAsync(string filePath); // 新增方法
         Task<UploadResponse> UploadFilesAsync(string targetPath, IFormFileCollection files);
         Task<bool> FileExistsAsync(string filePath);
         Task<bool> DirectoryExistsAsync(string directoryPath);
         string FormatFileSize(long bytes);
         string GetMimeType(string extension);
         string GetRootPath();
+
+        Task<bool> DeleteFileAsync(string filePath);
+        Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath);
     }
 
     public class FileService : IFileService
     {
+        private readonly IThumbnailService _thumbnailService;
         private readonly string _rootPath;
         private readonly ILogger<FileService> _logger;
 
-        public FileService(IConfiguration configuration, ILogger<FileService> logger)
+        public FileService(IConfiguration configuration, ILogger<FileService> logger, IThumbnailService thumbnailService)
         {
             _rootPath = configuration["FileServer:RootPath"] ?? @"D:\FileServer";
             _logger = logger;
+            _thumbnailService = thumbnailService;
 
-            // 确保根目录存在
             if (!Directory.Exists(_rootPath))
             {
                 Directory.CreateDirectory(_rootPath);
@@ -32,11 +37,41 @@ namespace FileServer.Services
             }
         }
 
+        public async Task<FileInfoModel> GetFileInfoAsync(string filePath)
+        {
+            var physicalPath = Path.Combine(_rootPath, filePath);
+
+            if (!File.Exists(physicalPath))
+            {
+                throw new FileNotFoundException($"文件不存在: {filePath}");
+            }
+
+            return await Task.Run(() =>
+            {
+                var fileInfo = new FileInfo(physicalPath);
+                var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
+
+                return new FileInfoModel
+                {
+                    Name = fileInfo.Name,
+                    Path = filePath,
+                    Size = fileInfo.Length, // 这里使用 FileInfo.Length 赋值给 FileInfoModel.Size
+                    SizeFormatted = FormatFileSize(fileInfo.Length),
+                    Extension = extension,
+                    LastModified = fileInfo.LastWriteTime,
+                    IsVideo = IsVideoFile(extension),
+                    IsAudio = IsAudioFile(extension),
+                    MimeType = GetMimeType(extension),
+                    Encoding = IsTextFile(extension) ? "utf-8" : ""
+                };
+            });
+        }
+
+
         public async Task<FileListResponse> GetFileListAsync(string relativePath)
         {
             var physicalPath = Path.Combine(_rootPath, relativePath);
 
-            // 安全验证
             if (!physicalPath.StartsWith(_rootPath))
             {
                 physicalPath = _rootPath;
@@ -55,7 +90,7 @@ namespace FileServer.Services
 
             try
             {
-                // 读取目录
+                // 处理目录
                 var directories = Directory.GetDirectories(physicalPath);
                 foreach (var dir in directories)
                 {
@@ -74,7 +109,7 @@ namespace FileServer.Services
                     }
                 }
 
-                // 读取文件
+                // 处理文件
                 var files = Directory.GetFiles(physicalPath);
                 foreach (var file in files)
                 {
@@ -82,11 +117,12 @@ namespace FileServer.Services
                     {
                         var fileInfo = new FileInfo(file);
                         var extension = Path.GetExtension(file).ToLowerInvariant();
+                        var relativeFilePath = Path.Combine(relativePath, fileInfo.Name).Replace("\\", "/");
 
-                        response.Files.Add(new FileInfoModel
+                        var fileModel = new FileInfoModel
                         {
                             Name = fileInfo.Name,
-                            Path = Path.Combine(relativePath, fileInfo.Name).Replace("\\", "/"),
+                            Path = relativeFilePath,
                             Size = fileInfo.Length,
                             SizeFormatted = FormatFileSize(fileInfo.Length),
                             Extension = extension,
@@ -94,8 +130,17 @@ namespace FileServer.Services
                             IsVideo = IsVideoFile(extension),
                             IsAudio = IsAudioFile(extension),
                             MimeType = GetMimeType(extension),
-                            Encoding = IsTextFile(extension) ? "utf-8" : ""
-                        });
+                            Encoding = IsTextFile(extension) ? "utf-8" : "",
+                            HasThumbnail = false // 默认没有缩略图
+                        };
+
+                        // 如果是图片文件，检查是否有缩略图
+                        if (IsImageFile(extension))
+                        {
+                            fileModel.HasThumbnail = await _thumbnailService.ThumbnailExistsAsync(relativeFilePath);
+                        }
+
+                        response.Files.Add(fileModel);
                     }
                     catch (Exception ex)
                     {
@@ -128,7 +173,6 @@ namespace FileServer.Services
             var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
             var contentType = GetMimeType(extension);
 
-            // 特别处理 WMV 文件
             if (extension == ".wmv")
             {
                 contentType = "video/x-ms-wmv";
@@ -147,7 +191,6 @@ namespace FileServer.Services
                 ? _rootPath
                 : Path.Combine(_rootPath, targetPath);
 
-            // 确保上传目录存在
             if (!Directory.Exists(uploadPath))
             {
                 Directory.CreateDirectory(uploadPath);
@@ -163,6 +206,9 @@ namespace FileServer.Services
 
                 var fileName = MakeValidFileName(file.FileName);
                 var filePath = Path.Combine(uploadPath, fileName);
+                var relativeFilePath = string.IsNullOrEmpty(targetPath)
+                    ? fileName
+                    : Path.Combine(targetPath, fileName).Replace("\\", "/");
 
                 try
                 {
@@ -175,13 +221,29 @@ namespace FileServer.Services
                     totalSize += fileInfo.Length;
                     uploadedFiles.Add(fileName);
 
+                    // 如果是图片文件，生成缩略图
+                    var extension = Path.GetExtension(fileName).ToLowerInvariant();
+                    if (IsImageFile(extension))
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await _thumbnailService.GenerateThumbnailAsync(relativeFilePath);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "生成缩略图失败: {FileName}", fileName);
+                            }
+                        });
+                    }
+
                     _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
                         fileName, filePath, FormatFileSize(fileInfo.Length));
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "文件保存失败: {FileName}", fileName);
-                    // 继续处理其他文件
                 }
             }
 
@@ -199,6 +261,55 @@ namespace FileServer.Services
                 TotalSize = totalSize,
                 TotalSizeFormatted = FormatFileSize(totalSize)
             };
+        }
+        // 添加删除文件方法（支持删除缩略图）
+        public async Task<bool> DeleteFileAsync(string filePath)
+        {
+            try
+            {
+                var physicalPath = Path.Combine(_rootPath, filePath);
+                if (!File.Exists(physicalPath))
+                {
+                    return false;
+                }
+
+                File.Delete(physicalPath);
+
+                // 如果是图片文件，删除对应的缩略图
+                var extension = Path.GetExtension(filePath).ToLowerInvariant();
+                if (IsImageFile(extension))
+                {
+                    await _thumbnailService.DeleteThumbnailAsync(filePath);
+                }
+
+                _logger.LogInformation("删除文件成功: {FilePath}", filePath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除文件失败: {FilePath}", filePath);
+                return false;
+            }
+        }
+
+        // 添加缩略图获取方法
+        public async Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+            if (!IsImageFile(extension))
+            {
+                throw new InvalidOperationException("非图片文件不支持缩略图");
+            }
+
+            var stream = await _thumbnailService.GetThumbnailStreamAsync(filePath);
+            return (stream, "image/jpeg", $"{Path.GetFileNameWithoutExtension(filePath)}_thumb.jpg");
+        }
+
+        // 添加图片文件判断方法
+        private bool IsImageFile(string extension)
+        {
+            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
+            return imageExtensions.Contains(extension.ToLowerInvariant());
         }
 
         public Task<bool> FileExistsAsync(string filePath)

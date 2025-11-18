@@ -12,6 +12,7 @@
         public bool IsAudio { get; set; }
         public string MimeType { get; set; } = string.Empty;
         public string Encoding { get; set; } = string.Empty;
+        public bool HasThumbnail { get; set; } // 新增：是否有缩略图
     }
 
     public class DirectoryInfoModel

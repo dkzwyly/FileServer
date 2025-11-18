@@ -1,6 +1,7 @@
 ﻿using FileServer.Models;
 using FileServer.Services;
 using Microsoft.AspNetCore.Mvc;
+using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Text;
 
@@ -14,16 +15,19 @@ namespace FileServer.Controllers
         private readonly IServerStatusService _statusService;
         private readonly ILogger<FileServerController> _logger;
         private readonly IConfiguration _configuration;
+        private readonly IMemoryMappedFileService _memoryMappedService;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
                                   ILogger<FileServerController> logger,
-                                  IConfiguration configuration)
+                                  IConfiguration configuration,
+                                  IMemoryMappedFileService memoryMappedService)
         {
             _fileService = fileService;
             _statusService = statusService;
             _logger = logger;
             _configuration = configuration;
+            _memoryMappedService = memoryMappedService;
         }
 
         [HttpGet("status")]
@@ -42,7 +46,7 @@ namespace FileServer.Controllers
                 Status = status.IsRunning ? "healthy" : "unhealthy",
                 Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                 ActiveConnections = status.ActiveConnections,
-                Uptime = status.Uptime
+                Uptime = FormatUptime(status.Uptime) // 修正这里
             };
             return Ok(health);
         }
@@ -59,7 +63,7 @@ namespace FileServer.Controllers
                 httpsPort = config?.HttpsPort ?? 8081,
                 supportedProtocols = new[] { "HTTP/1.1", "HTTP/2", "HTTP/3" },
                 recommendedClient = "支持 HTTP/3 的客户端 (Chrome/Edge 最新版)",
-                serverUptime = status.Uptime,
+                serverUptime = FormatUptime(status.Uptime), // 修正这里
                 activeConnections = status.ActiveConnections
             };
 
@@ -94,27 +98,18 @@ namespace FileServer.Controllers
                 _statusService.IncrementRequests();
                 _statusService.IncrementConnections();
 
-                // 解码路径
                 path = WebUtility.UrlDecode(path);
+                var fileInfo = await _fileService.GetFileInfoAsync(path);
 
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
-
-                // 设置响应头
-                Response.Headers.Append("Accept-Ranges", "bytes");
-                Response.Headers.Append("Cache-Control", "public, max-age=3600");
-
-                // 处理范围请求
-                var rangeHeader = Request.Headers["Range"].ToString();
-                if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
+                // 对于大文件使用内存映射，小文件使用普通流
+                if (fileInfo.Size > 10 * 1024 * 1024) // 10MB以上使用内存映射
                 {
-                    return await HandleRangeRequest(stream, contentType, fileName, rangeHeader);
+                    return await DownloadWithMemoryMapping(path, fileInfo, false);
                 }
-
-                // 对于非范围请求，直接返回文件
-                var fileResult = File(stream, contentType, fileName, enableRangeProcessing: true);
-
-                _logger.LogInformation("文件下载: {FileName} (完整文件)", fileName);
-                return fileResult;
+                else
+                {
+                    return await DownloadWithStream(path, fileInfo, false);
+                }
             }
             catch (FileNotFoundException ex)
             {
@@ -139,49 +134,50 @@ namespace FileServer.Controllers
                 _statusService.IncrementRequests();
                 _statusService.IncrementConnections();
 
-                // 解码路径
                 path = WebUtility.UrlDecode(path);
-
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
-                var extension = Path.GetExtension(fileName).ToLowerInvariant();
+                var fileInfo = await _fileService.GetFileInfoAsync(path);
+                var extension = Path.GetExtension(fileInfo.Name).ToLowerInvariant();
 
                 // 设置预览相关的响应头
                 Response.Headers.Append("Accept-Ranges", "bytes");
                 Response.Headers.Append("Cache-Control", "public, max-age=3600");
-                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileName)}\"");
+                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileInfo.Name)}\"");
 
-                // 特别处理 MKV 文件 - 强制设置正确的 MIME 类型
+                // 特别处理 MKV 和 WMV 文件
                 if (extension == ".mkv")
                 {
-                    contentType = "video/x-matroska";
-                    _logger.LogInformation("处理 MKV 文件: {FileName}, MIME类型: {ContentType}", fileName, contentType);
+                    Response.ContentType = "video/x-matroska";
+                    _logger.LogInformation("处理 MKV 文件: {FileName}, MIME类型: {ContentType}", fileInfo.Name, "video/x-matroska");
                 }
-
-                // 特别处理 WMV 文件
                 if (extension == ".wmv")
                 {
-                    contentType = "video/x-ms-wmv";
+                    Response.ContentType = "video/x-ms-wmv";
                 }
 
-                // 检查范围请求头
+                // 检查范围请求
                 var rangeHeader = Request.Headers["Range"].ToString();
                 if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
                 {
-                    _logger.LogInformation("处理范围请求: {FileName} (范围: {RangeHeader})", fileName, rangeHeader);
-                    return await HandleRangeRequest(stream, contentType, fileName, rangeHeader, true);
+                    _logger.LogInformation("处理范围请求: {FileName} (范围: {RangeHeader})", fileInfo.Name, rangeHeader);
+
+                    if (fileInfo.Size > 10 * 1024 * 1024)
+                        return await DownloadWithMemoryMapping(path, fileInfo, true, rangeHeader);
+                    else
+                        return await DownloadWithStream(path, fileInfo, true, rangeHeader);
                 }
 
-                // 对于文本文件，返回JSON内容（不进行流式传输）
+                // 对于文本文件，返回JSON内容
                 if (IsTextFile(extension))
                 {
-                    _logger.LogInformation("文本文件预览: {FileName}", fileName);
-                    return await HandleTextFilePreview(stream, contentType, fileName);
+                    _logger.LogInformation("文本文件预览: {FileName}", fileInfo.Name);
+                    return await HandleTextFilePreview(path);
                 }
 
-                // 对于媒体文件（图片、视频、音频），启用范围请求处理
-                _logger.LogInformation("媒体文件预览: {FileName} (类型: {ContentType}, 扩展名: {Extension})",
-                    fileName, contentType, extension);
-                return File(stream, contentType, enableRangeProcessing: true);
+                // 对于媒体文件，使用内存映射
+                if (fileInfo.Size > 10 * 1024 * 1024)
+                    return await DownloadWithMemoryMapping(path, fileInfo, true);
+                else
+                    return await DownloadWithStream(path, fileInfo, true);
             }
             catch (FileNotFoundException ex)
             {
@@ -256,6 +252,117 @@ namespace FileServer.Controllers
             }
         }
 
+        // 在 FileServerController.cs 中添加
+        [HttpGet("thumbnail/{*path}")]
+        public async Task<IActionResult> GetThumbnail(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                path = WebUtility.UrlDecode(path);
+                var extension = Path.GetExtension(path).ToLowerInvariant();
+
+                _logger.LogInformation("缩略图请求 - 路径: {Path}, 扩展名: {Extension}", path, extension);
+
+                // 只支持图片文件的缩略图
+                if (!IsImageFile(extension))
+                {
+                    _logger.LogWarning("非图片文件请求缩略图: {Path}", path);
+                    return BadRequest(new { error = "非图片文件不支持缩略图" });
+                }
+
+                // 检查原文件是否存在
+                var fileExists = await _fileService.FileExistsAsync(path);
+                if (!fileExists)
+                {
+                    _logger.LogWarning("原文件不存在: {Path}", path);
+                    return NotFound(new { error = "原文件不存在" });
+                }
+
+                _logger.LogInformation("开始获取缩略图: {Path}", path);
+                var (stream, contentType, fileName) = await _fileService.GetThumbnailAsync(path);
+
+                Response.Headers.Append("Cache-Control", "public, max-age=3600"); // 缓存1小时
+                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileName)}\"");
+
+                _logger.LogInformation("成功返回缩略图: {Path}", path);
+                return File(stream, contentType);
+            }
+            catch (FileNotFoundException ex)
+            {
+                _logger.LogWarning("缩略图文件不存在: {Path}, 错误: {Message}", path, ex.Message);
+
+                // 如果缩略图不存在，尝试生成
+                try
+                {
+                    _logger.LogInformation("尝试生成缩略图: {Path}", path);
+                    var thumbnailService = HttpContext.RequestServices.GetRequiredService<IThumbnailService>();
+                    var generated = await thumbnailService.GenerateThumbnailAsync(path);
+
+                    if (generated)
+                    {
+                        _logger.LogInformation("缩略图生成成功，重新获取: {Path}", path);
+                        var (stream, contentType, fileName) = await _fileService.GetThumbnailAsync(path);
+                        return File(stream, contentType);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("缩略图生成失败: {Path}", path);
+                        return NotFound(new { error = "缩略图不存在且生成失败" });
+                    }
+                }
+                catch (Exception genEx)
+                {
+                    _logger.LogError(genEx, "缩略图生成过程出错: {Path}", path);
+                    return NotFound(new { error = $"缩略图生成失败: {genEx.Message}" });
+                }
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning("无效操作: {Path}, 错误: {Message}", path, ex.Message);
+                return BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取缩略图失败: {Path}", path);
+                return StatusCode(500, new { error = "获取缩略图失败", message = ex.Message });
+            }
+        }
+
+        [HttpDelete("delete/{*path}")]
+        public async Task<IActionResult> DeleteFile(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                path = WebUtility.UrlDecode(path);
+                var result = await _fileService.DeleteFileAsync(path);
+
+                if (result)
+                {
+                    return Ok(new { success = true, message = "文件删除成功" });
+                }
+                else
+                {
+                    return NotFound(new { error = "文件不存在" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除文件失败: {Path}", path);
+                return StatusCode(500, new { error = "删除文件失败", message = ex.Message });
+            }
+        }
+
+        // 添加图片文件判断方法
+        private bool IsImageFile(string extension)
+        {
+            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
+            return imageExtensions.Contains(extension.ToLowerInvariant());
+        }
+
         [HttpGet("stream/{*path}")]
         public async Task<IActionResult> StreamFile(string path)
         {
@@ -264,10 +371,8 @@ namespace FileServer.Controllers
                 _statusService.IncrementRequests();
                 _statusService.IncrementConnections();
 
-                // 解码路径
                 path = WebUtility.UrlDecode(path);
-
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+                var fileInfo = await _fileService.GetFileInfoAsync(path);
 
                 // 专门为流媒体优化的设置
                 Response.Headers.Append("Accept-Ranges", "bytes");
@@ -275,13 +380,19 @@ namespace FileServer.Controllers
                 Response.Headers.Append("Content-Disposition", "inline");
 
                 var rangeHeader = Request.Headers["Range"].ToString();
-                if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
-                {
-                    return await HandleRangeRequest(stream, contentType, fileName, rangeHeader, true);
-                }
 
-                _logger.LogInformation("文件流式传输: {FileName}", fileName);
-                return File(stream, contentType, enableRangeProcessing: true);
+                // 对于流媒体文件，强制使用内存映射以获得最佳性能
+                if (fileInfo.Size > 5 * 1024 * 1024) // 5MB以上视频强制使用内存映射
+                {
+                    return await DownloadWithMemoryMapping(path, fileInfo, true, rangeHeader);
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
+                        return await DownloadWithStream(path, fileInfo, true, rangeHeader);
+                    else
+                        return await DownloadWithStream(path, fileInfo, true);
+                }
             }
             catch (FileNotFoundException ex)
             {
@@ -295,6 +406,120 @@ namespace FileServer.Controllers
             finally
             {
                 _statusService.DecrementConnections();
+            }
+        }
+
+        #region 私有方法 - 高性能文件传输
+
+        private async Task<IActionResult> DownloadWithMemoryMapping(string path, FileInfoModel fileInfo, bool isPreview, string rangeHeader = null)
+        {
+            try
+            {
+                _logger.LogInformation("使用内存映射传输文件: {FileName} (大小: {Size})",
+                    fileInfo.Name, fileInfo.SizeFormatted);
+
+                var (mappedFile, contentType) = await _memoryMappedService.OpenMemoryMappedFile(path);
+
+                if (!string.IsNullOrEmpty(rangeHeader))
+                {
+                    return await HandleMemoryMappedRangeRequest(mappedFile, contentType, fileInfo, rangeHeader, isPreview);
+                }
+
+                Response.ContentType = contentType;
+                Response.Headers.Append("Content-Length", fileInfo.Size.ToString());
+
+                if (!isPreview)
+                {
+                    Response.Headers.Append("Content-Disposition", $"attachment; filename=\"{WebUtility.UrlEncode(fileInfo.Name)}\"");
+                }
+
+                await StreamMemoryMappedData(mappedFile, 0, fileInfo.Size);
+                return new EmptyResult();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "内存映射文件传输失败: {Path}", path);
+                throw;
+            }
+        }
+
+        private async Task<IActionResult> DownloadWithStream(string path, FileInfoModel fileInfo, bool isPreview, string rangeHeader = null)
+        {
+            var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+
+            if (!string.IsNullOrEmpty(rangeHeader))
+            {
+                return await HandleRangeRequest(stream, contentType, fileName, rangeHeader, isPreview);
+            }
+
+            var fileResult = File(stream, contentType, isPreview ? null : fileName, enableRangeProcessing: true);
+
+            if (isPreview)
+            {
+                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileName)}\"");
+            }
+
+            _logger.LogInformation("流式传输文件: {FileName}", fileName);
+            return fileResult;
+        }
+
+        private async Task<IActionResult> HandleMemoryMappedRangeRequest(MemoryMappedFile mmf, string contentType, FileInfoModel fileInfo, string rangeHeader, bool isPreview)
+        {
+            try
+            {
+                var fileSize = fileInfo.Size;
+                var range = rangeHeader.Substring(6);
+                var parts = range.Split('-');
+
+                long start = 0, end = fileSize - 1;
+
+                if (long.TryParse(parts[0], out long startRange))
+                    start = startRange;
+                if (parts.Length > 1 && long.TryParse(parts[1], out long endRange))
+                    end = endRange;
+                else
+                    end = fileSize - 1;
+
+                // 验证范围
+                if (start < 0) start = 0;
+                if (end >= fileSize) end = fileSize - 1;
+                if (start > end)
+                {
+                    Response.StatusCode = 416;
+                    Response.Headers.Append("Content-Range", $"bytes */{fileSize}");
+                    _logger.LogWarning("范围请求无效: {Start}-{End} (文件大小: {FileSize})", start, end, fileSize);
+                    return new EmptyResult();
+                }
+
+                long contentLength = end - start + 1;
+                Response.StatusCode = 206;
+                Response.Headers.Append("Content-Range", $"bytes {start}-{end}/{fileSize}");
+                Response.ContentType = contentType;
+                Response.Headers.Append("Content-Length", contentLength.ToString());
+
+                if (isPreview)
+                {
+                    Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileInfo.Name)}\"");
+                }
+                else
+                {
+                    Response.Headers.Append("Content-Disposition", $"attachment; filename=\"{WebUtility.UrlEncode(fileInfo.Name)}\"");
+                }
+
+                using (var stream = mmf.CreateViewStream(start, contentLength, MemoryMappedFileAccess.Read))
+                {
+                    await StreamDataWithRetry(stream, contentLength);
+                }
+
+                _logger.LogInformation("内存映射范围请求完成: {FileName} ({Start}-{End}/{Total}, 长度: {ContentLength})",
+                    fileInfo.Name, start, end, fileSize, contentLength);
+
+                return new EmptyResult();
+            }
+            catch (Exception ex) when (IsConnectionError(ex))
+            {
+                _logger.LogInformation("客户端连接中断: {FileName} (内存映射范围请求)", fileInfo.Name);
+                return new EmptyResult();
             }
         }
 
@@ -323,19 +548,18 @@ namespace FileServer.Controllers
                 if (end >= fileSize) end = fileSize - 1;
                 if (start > end)
                 {
-                    Response.StatusCode = 416; // Range Not Satisfiable
+                    Response.StatusCode = 416;
                     Response.Headers.Append("Content-Range", $"bytes */{fileSize}");
                     _logger.LogWarning("范围请求无效: {Start}-{End} (文件大小: {FileSize})", start, end, fileSize);
                     return new EmptyResult();
                 }
 
                 long contentLength = end - start + 1;
-                Response.StatusCode = 206; // Partial Content
+                Response.StatusCode = 206;
                 Response.Headers.Append("Content-Range", $"bytes {start}-{end}/{fileSize}");
                 Response.ContentType = contentType;
                 Response.Headers.Append("Content-Length", contentLength.ToString());
 
-                // 对于预览模式，设置内联显示
                 if (isPreview)
                 {
                     Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(fileName)}\"");
@@ -351,7 +575,6 @@ namespace FileServer.Controllers
                     _logger.LogInformation("跳转到位置: {Start}", start);
                 }
 
-                // 使用更高效的流式传输
                 await StreamDataWithRetry(stream, contentLength);
 
                 _logger.LogInformation("范围请求处理完成: {FileName} ({Start}-{End}/{Total}, 长度: {ContentLength})",
@@ -370,45 +593,56 @@ namespace FileServer.Controllers
             }
         }
 
-        private async Task<IActionResult> HandleTextFilePreview(Stream stream, string contentType, string fileName)
+        private async Task StreamMemoryMappedData(MemoryMappedFile mmf, long start, long length)
         {
-            try
+            const int bufferSize = 131072; // 128KB 缓冲区，提升大文件传输性能
+            var buffer = new byte[bufferSize];
+            long bytesRemaining = length;
+            int retryCount = 0;
+            const int maxRetries = 3;
+
+            _logger.LogDebug("开始内存映射流式传输，长度: {Length}", length);
+
+            using (var stream = mmf.CreateViewStream(start, length, MemoryMappedFileAccess.Read))
             {
-                // 限制文本文件大小（1MB）
-                if (stream.Length > 1024 * 1024)
+                while (bytesRemaining > 0 && retryCount < maxRetries)
                 {
-                    return Ok(new
+                    try
                     {
-                        type = "text",
-                        fileName,
-                        content = "文件过大，不支持预览",
-                        truncated = true,
-                        size = stream.Length
-                    });
+                        int bytesToRead = (int)Math.Min(buffer.Length, bytesRemaining);
+                        int bytesRead = await stream.ReadAsync(buffer, 0, bytesToRead);
+
+                        if (bytesRead == 0) break;
+
+                        await Response.Body.WriteAsync(buffer, 0, bytesRead);
+                        await Response.Body.FlushAsync();
+
+                        bytesRemaining -= bytesRead;
+                        retryCount = 0;
+
+                        // 每传输 10MB 记录一次进度
+                        if ((length - bytesRemaining) % (10 * 1024 * 1024) < bufferSize)
+                        {
+                            _logger.LogDebug("内存映射传输进度: {Transferred}/{Total} ({Percentage}%)",
+                                length - bytesRemaining, length,
+                                (int)((length - bytesRemaining) * 100 / length));
+                        }
+                    }
+                    catch (Exception ex) when (IsConnectionError(ex) && retryCount < maxRetries - 1)
+                    {
+                        retryCount++;
+                        _logger.LogWarning("内存映射传输中断，重试 {RetryCount}/{MaxRetries}", retryCount, maxRetries);
+                        await Task.Delay(100 * retryCount);
+                    }
                 }
-
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-                var content = await reader.ReadToEndAsync();
-
-                return Ok(new
-                {
-                    type = "text",
-                    fileName,
-                    content,
-                    encoding = "utf-8",
-                    size = content.Length
-                });
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "文本文件预览失败: {FileName}", fileName);
-                return StatusCode(500, new { error = "文本文件预览失败", message = ex.Message });
-            }
+
+            _logger.LogDebug("内存映射流式传输完成，剩余字节: {BytesRemaining}", bytesRemaining);
         }
 
         private async Task StreamDataWithRetry(Stream stream, long totalLength)
         {
-            const int bufferSize = 81920; // 80KB 缓冲区
+            const int bufferSize = 131072; // 128KB 缓冲区
             var buffer = new byte[bufferSize];
             long bytesRemaining = totalLength;
             int retryCount = 0;
@@ -461,6 +695,69 @@ namespace FileServer.Controllers
             }
         }
 
+        private async Task<IActionResult> HandleTextFilePreview(string path)
+        {
+            try
+            {
+                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+
+                using (stream)
+                {
+                    if (stream.Length > 1024 * 1024)
+                    {
+                        return Ok(new
+                        {
+                            type = "text",
+                            fileName,
+                            content = "文件过大，不支持预览",
+                            truncated = true,
+                            size = stream.Length
+                        });
+                    }
+
+                    using var reader = new StreamReader(stream, Encoding.UTF8);
+                    var content = await reader.ReadToEndAsync();
+
+                    return Ok(new
+                    {
+                        type = "text",
+                        fileName,
+                        content,
+                        encoding = "utf-8",
+                        size = content.Length
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "文本文件预览失败");
+                return StatusCode(500, new { error = "文本文件预览失败", message = ex.Message });
+            }
+        }
+
+        private string FormatUptime(long uptimeInMilliseconds)
+        {
+            // 假设 uptime 是以毫秒为单位的时间
+            var uptime = TimeSpan.FromMilliseconds(uptimeInMilliseconds);
+
+            if (uptime.TotalDays >= 1)
+            {
+                return $"{(int)uptime.TotalDays}天 {uptime.Hours}小时 {uptime.Minutes}分钟";
+            }
+            else if (uptime.TotalHours >= 1)
+            {
+                return $"{(int)uptime.TotalHours}小时 {uptime.Minutes}分钟 {uptime.Seconds}秒";
+            }
+            else if (uptime.TotalMinutes >= 1)
+            {
+                return $"{(int)uptime.TotalMinutes}分钟 {uptime.Seconds}秒";
+            }
+            else
+            {
+                return $"{uptime.Seconds}秒";
+            }
+        }
+
         private bool IsConnectionError(Exception ex)
         {
             var errorMessage = ex.Message.ToLowerInvariant();
@@ -480,6 +777,8 @@ namespace FileServer.Controllers
             };
             return textExtensions.Contains(extension.ToLowerInvariant());
         }
+
+        #endregion
     }
 
     // 扩展方法
@@ -491,5 +790,21 @@ namespace FileServer.Controllers
             // 这里简化处理，实际使用时需要修改
             return @"D:\FileServer";
         }
+    }
+
+    // 健康响应模型
+    public class HealthResponse
+    {
+        public string Status { get; set; } = string.Empty;
+        public string Timestamp { get; set; } = string.Empty;
+        public int ActiveConnections { get; set; }
+        public string Uptime { get; set; } = string.Empty; // 改为字符串类型
+    }
+
+    // 文件服务器配置模型
+    public class FileServerConfig
+    {
+        public bool EnableQuic { get; set; }
+        public int HttpsPort { get; set; }
     }
 }

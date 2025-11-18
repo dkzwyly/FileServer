@@ -12,7 +12,14 @@ builder.Services.Configure<FileServerConfig>(
 
 // 添加服务
 builder.Services.AddSingleton<IServerStatusService, ServerStatusService>();
+
+// 添加缩略图服务
+builder.Services.AddScoped<IThumbnailService, ThumbnailService>();
+
+// 更新文件服务注册（确保传递 thumbnailService）
 builder.Services.AddScoped<IFileService, FileService>();
+// 添加内存映射服务
+builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
 
 // 添加控制器
 builder.Services.AddControllers();
