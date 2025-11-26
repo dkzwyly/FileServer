@@ -78,8 +78,66 @@ app.MapGet("/", async context =>
     statusService.IncrementRequests();
 
     var status = statusService.GetStatus();
+    var html = GetHomePageHtml(status, certificate);
 
-    var html = $@"
+    context.Response.ContentType = "text/html; charset=utf-8";
+    await context.Response.WriteAsync(html);
+});
+
+// 文件浏览器页面
+app.MapGet("/browser", async context =>
+{
+    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
+    statusService.IncrementRequests();
+
+    var html = GetBrowserPageHtml();
+
+    context.Response.ContentType = "text/html; charset=utf-8";
+    await context.Response.WriteAsync(html);
+});
+
+// 播放器页面
+app.MapGet("/player", async context =>
+{
+    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
+    statusService.IncrementRequests();
+
+    var html = GetPlayerPageHtml();
+
+    context.Response.ContentType = "text/html; charset=utf-8";
+    await context.Response.WriteAsync(html);
+});
+
+// 健康检查端点
+app.MapGet("/health", async context =>
+{
+    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
+    statusService.IncrementRequests();
+
+    var status = statusService.GetStatus();
+    var health = new HealthResponse
+    {
+        Status = status.IsRunning ? "healthy" : "unhealthy",
+        Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+        ActiveConnections = status.ActiveConnections,
+        Uptime = status.Uptime
+    };
+
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(health));
+});
+
+Console.WriteLine("🚀 文件服务器启动成功!");
+Console.WriteLine($"🌐 HTTP 访问: http://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpPort", 8080)}");
+Console.WriteLine($"🔒 HTTPS 访问: https://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
+Console.WriteLine($"📡 内网访问: https://{GetLocalIPAddress()}:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
+
+app.Run();
+
+// HTML 页面生成方法
+static string GetHomePageHtml(ServerStatus status, X509Certificate2? certificate)
+{
+    return $@"
 <!DOCTYPE html>
 <html>
 <head>
@@ -167,18 +225,11 @@ app.MapGet("/", async context =>
     </script>
 </body>
 </html>";
+}
 
-    context.Response.ContentType = "text/html; charset=utf-8";
-    await context.Response.WriteAsync(html);
-});
-
-// 文件浏览器页面
-app.MapGet("/browser", async context =>
+static string GetBrowserPageHtml()
 {
-    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
-    statusService.IncrementRequests();
-
-    var html = @"
+    return @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -290,35 +341,35 @@ app.MapGet("/browser", async context =>
                 html += '</div>';
             }
             
-             // 添加文件 - 修改这部分
-             for (let i = 0; i < data.files.length; i++) {
-                 const file = data.files[i];
-                 const fileExtension = file.name.split('.').pop().toLowerCase();
+            // 添加文件
+            for (let i = 0; i < data.files.length; i++) {
+                const file = data.files[i];
+                const fileExtension = file.name.split('.').pop().toLowerCase();
         
-             // 根据文件类型确定图标和预览能力
-                  const fileIcon = getFileIcon(fileExtension);
-                 const canPreview = canFileBePreviewed(fileExtension);
+                // 根据文件类型确定图标和预览能力
+                const fileIcon = getFileIcon(fileExtension);
+                const canPreview = canFileBePreviewed(fileExtension);
         
-                  html += '<div class=""file-item file"">';
-                  html += '<div class=""file-name"">';
-                  html += fileIcon + ' ' + file.name;  // 使用文件图标
-                  html += '</div>';
-                  html += '<div class=""file-size"">' + file.sizeFormatted + '</div>';
-                  html += '<div class=""file-date"">' + new Date(file.lastModified).toLocaleString() + '</div>';
-                  html += '<div class=""file-actions"">';
-                  html += '<a href=""/api/fileserver/download/' + file.path + '"" target=""_blank"">下载</a>';
+                html += '<div class=""file-item file"">';
+                html += '<div class=""file-name"">';
+                html += fileIcon + ' ' + file.name;
+                html += '</div>';
+                html += '<div class=""file-size"">' + file.sizeFormatted + '</div>';
+                html += '<div class=""file-date"">' + new Date(file.lastModified).toLocaleString() + '</div>';
+                html += '<div class=""file-actions"">';
+                html += '<a href=""/api/fileserver/download/' + file.path + '"" target=""_blank"">下载</a>';
          
-             // 为可预览的文件添加预览按钮
-              if (canPreview) {
-                 const previewType = getPreviewType(fileExtension);
-                 html += ' | <a href=""/player?path=' + encodeURIComponent(file.path) + '&type=' + previewType + '"" target=""_blank"">预览</a>';
-        }
+                // 为可预览的文件添加预览按钮
+                if (canPreview) {
+                    const previewType = getPreviewType(fileExtension);
+                    html += ' | <a href=""/player?path=' + encodeURIComponent(file.path) + '&type=' + previewType + '"" target=""_blank"">预览</a>';
+                }
         
-        html += '</div>';
-        html += '</div>';
-    }
+                html += '</div>';
+                html += '</div>';
+            }
     
-    fileList.innerHTML = html;
+            fileList.innerHTML = html;
         }
 
         function updateBreadcrumb(currentPath, parentPath) {
@@ -378,68 +429,60 @@ app.MapGet("/browser", async context =>
             }
         }
 
-                // 获取文件图标
-    function getFileIcon(extension) {
-        const icons = {
-            'mp4': '🎬', 'avi': '🎬', 'mov': '🎬', 'mkv': '🎬', 'wmv': '🎬', 'flv': '🎬', 'webm': '🎬', 'm4v': '🎬',
-            'mp3': '🎵', 'wav': '🎵', 'flac': '🎵', 'aac': '🎵', 'ogg': '🎵', 'm4a': '🎵', 'wma': '🎵',
-            'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'bmp': '🖼️', 'webp': '🖼️',
-            'txt': '📄', 'pdf': '📄', 'doc': '📄', 'docx': '📄',
-            'zip': '📦', 'rar': '📦', '7z': '📦',
-            'xml': '📋', 'json': '📋', 'csv': '📋', 'html': '🌐', 'htm': '🌐', 'css': '🎨', 'js': '⚡'
-        };
-        return icons[extension] || '📄';
-    }
+        // 获取文件图标
+        function getFileIcon(extension) {
+            const icons = {
+                'mp4': '🎬', 'avi': '🎬', 'mov': '🎬', 'mkv': '🎬', 'wmv': '🎬', 'flv': '🎬', 'webm': '🎬', 'm4v': '🎬',
+                'mp3': '🎵', 'wav': '🎵', 'flac': '🎵', 'aac': '🎵', 'ogg': '🎵', 'm4a': '🎵', 'wma': '🎵',
+                'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'bmp': '🖼️', 'webp': '🖼️',
+                'txt': '📄', 'pdf': '📄', 'doc': '📄', 'docx': '📄',
+                'zip': '📦', 'rar': '📦', '7z': '📦',
+                'xml': '📋', 'json': '📋', 'csv': '📋', 'html': '🌐', 'htm': '🌐', 'css': '🎨', 'js': '⚡'
+            };
+            return icons[extension] || '📄';
+        }
 
-    // 判断文件是否可以预览
-    function canFileBePreviewed(extension) {
-        const previewableExtensions = [
-            // 文本文件
-            'txt', 'log', 'xml', 'json', 'csv', 'html', 'htm', 'css', 'js', 
-            'md', 'cs', 'java', 'cpp', 'c', 'py', 'php', 'rb', 'config', 
-            'yml', 'yaml', 'ini', 'sql',
-            // 图片文件
-            'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',
-            // 视频文件
-            'mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v',
-            // 音频文件
-            'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'
-        ];
-        return previewableExtensions.includes(extension);
-    }
+        // 判断文件是否可以预览
+        function canFileBePreviewed(extension) {
+            const previewableExtensions = [
+                // 文本文件
+                'txt', 'log', 'xml', 'json', 'csv', 'html', 'htm', 'css', 'js', 
+                'md', 'cs', 'java', 'cpp', 'c', 'py', 'php', 'rb', 'config', 
+                'yml', 'yaml', 'ini', 'sql',
+                // 图片文件
+                'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',
+                // 视频文件
+                'mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v',
+                // 音频文件
+                'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'
+            ];
+            return previewableExtensions.includes(extension);
+        }
 
-    // 获取预览类型
-    function getPreviewType(extension) {
-        const textExtensions = ['txt', 'log', 'xml', 'json', 'csv', 'html', 'htm', 'css', 'js', 'md', 'cs', 'java', 'cpp', 'c', 'py', 'php', 'rb', 'config', 'yml', 'yaml', 'ini', 'sql'];
-        const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
-        const videoExtensions = ['mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v'];
-        const audioExtensions = ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'];
-        
-        if (textExtensions.includes(extension)) return 'text';
-        if (imageExtensions.includes(extension)) return 'image';
-        if (videoExtensions.includes(extension)) return 'video';
-        if (audioExtensions.includes(extension)) return 'audio';
-        return 'text'; // 默认作为文本处理
-    }
+        // 获取预览类型
+        function getPreviewType(extension) {
+            const textExtensions = ['txt', 'log', 'xml', 'json', 'csv', 'html', 'htm', 'css', 'js', 'md', 'cs', 'java', 'cpp', 'c', 'py', 'php', 'rb', 'config', 'yml', 'yaml', 'ini', 'sql'];
+            const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
+            const videoExtensions = ['mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 'webm', 'm4v'];
+            const audioExtensions = ['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma'];
+            
+            if (textExtensions.includes(extension)) return 'text';
+            if (imageExtensions.includes(extension)) return 'image';
+            if (videoExtensions.includes(extension)) return 'video';
+            if (audioExtensions.includes(extension)) return 'audio';
+            return 'text'; // 默认作为文本处理
+        }
 
         // 初始加载根目录
         loadPath('');
     </script>
 </body>
 </html>";
+}
 
-    context.Response.ContentType = "text/html; charset=utf-8";
-    await context.Response.WriteAsync(html);
-});
-
-
-// 播放器页面
-app.MapGet("/player", async context =>
+static string GetPlayerPageHtml()
 {
-    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
-    statusService.IncrementRequests();
-
-    var html = @"
+    return @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -622,85 +665,85 @@ app.MapGet("/player", async context =>
             }
         }
 
-       // 修改图片加载函数 - 使用预览端点
-function loadImageFile(path) {
-    const fileName = path.split('/').pop();
-    const content = `
-        <div class='file-info'>
-            <h3>🖼️ ${fileName} <span class='format-badge'>图片</span></h3>
-            <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载图片</a>
-        </div>
-        <div class='player-container'>
-            <img src='/api/fileserver/preview/${encodeURIComponent(path)}' alt='${fileName}' class='image-preview' onerror='handleImageError(this, ""${fileName}"")'>
-        </div>
-    `;
-    document.getElementById('player-content').innerHTML = content;
-}
+        // 修改图片加载函数 - 使用预览端点
+        function loadImageFile(path) {
+            const fileName = path.split('/').pop();
+            const content = `
+                <div class='file-info'>
+                    <h3>🖼️ ${fileName} <span class='format-badge'>图片</span></h3>
+                    <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载图片</a>
+                </div>
+                <div class='player-container'>
+                    <img src='/api/fileserver/preview/${encodeURIComponent(path)}' alt='${fileName}' class='image-preview' onerror='handleImageError(this, ""${fileName}"")'>
+                </div>
+            `;
+            document.getElementById('player-content').innerHTML = content;
+        }
 
-// 修改视频加载函数 - 使用预览端点
-function loadVideoFile(path) {
-    const fileName = path.split('/').pop();
-    const extension = fileName.split('.').pop().toLowerCase();
-    const contentType = getVideoContentType(extension);
-    
-    // 对于 MKV 文件，提供多个 source 选项
-    let videoSources = '';
-    if (extension === 'mkv') {
-        videoSources = `
-            <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='video/x-matroska'>
-            <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='video/mp4'>
-        `;
-    } else {
-        videoSources = `<source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='${contentType}'>`;
-    }
-    
-    const content = `
-        <div class='file-info'>
-            <h3>🎬 ${fileName} <span class='format-badge'>视频</span></h3>
-            <p>格式: ${extension.toUpperCase()} | 支持范围请求和流式传输</p>
-            <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载视频</a>
-        </div>
-        <div class='player-container'>
-            <video class='video-player' controls autoplay playsinline preload=""auto"">
-                ${videoSources}
-                您的浏览器不支持此视频格式。
-                ${extension === 'mkv' ? '<br><strong>MKV 提示:</strong> 请使用最新版 Chrome/Edge 浏览器，或安装 VLC 插件。' : ''}
-            </video>
-            <div class='controls'>
-                <button class='control-btn' onclick='toggleFullscreen()'>全屏</button>
-                <button class='control-btn' onclick='togglePictureInPicture()'>画中画</button>
-                <button class='control-btn' onclick='toggleMute()'>静音</button>
-                ${extension === 'mkv' ? '<button class=""control-btn"" onclick=""showMKVHelp()"">MKV 帮助</button>' : ''}
-            </div>
-        </div>
-    `;
-    document.getElementById('player-content').innerHTML = content;
-}
+        // 修改视频加载函数 - 使用预览端点
+        function loadVideoFile(path) {
+            const fileName = path.split('/').pop();
+            const extension = fileName.split('.').pop().toLowerCase();
+            const contentType = getVideoContentType(extension);
+            
+            // 对于 MKV 文件，提供多个 source 选项
+            let videoSources = '';
+            if (extension === 'mkv') {
+                videoSources = `
+                    <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='video/x-matroska'>
+                    <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='video/mp4'>
+                `;
+            } else {
+                videoSources = `<source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='${contentType}'>`;
+            }
+            
+            const content = `
+                <div class='file-info'>
+                    <h3>🎬 ${fileName} <span class='format-badge'>视频</span></h3>
+                    <p>格式: ${extension.toUpperCase()} | 支持范围请求和流式传输</p>
+                    <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载视频</a>
+                </div>
+                <div class='player-container'>
+                    <video class='video-player' controls autoplay playsinline preload=""auto"">
+                        ${videoSources}
+                        您的浏览器不支持此视频格式。
+                        ${extension === 'mkv' ? '<br><strong>MKV 提示:</strong> 请使用最新版 Chrome/Edge 浏览器，或安装 VLC 插件。' : ''}
+                    </video>
+                    <div class='controls'>
+                        <button class='control-btn' onclick='toggleFullscreen()'>全屏</button>
+                        <button class='control-btn' onclick='togglePictureInPicture()'>画中画</button>
+                        <button class='control-btn' onclick='toggleMute()'>静音</button>
+                        ${extension === 'mkv' ? '<button class=""control-btn"" onclick=""showMKVHelp()"">MKV 帮助</button>' : ''}
+                    </div>
+                </div>
+            `;
+            document.getElementById('player-content').innerHTML = content;
+        }
 
-// 修改音频加载函数 - 使用预览端点
-function loadAudioFile(path) {
-    const fileName = path.split('/').pop();
-    const extension = fileName.split('.').pop().toLowerCase();
-    const contentType = getAudioContentType(extension);
-    
-    const content = `
-        <div class='file-info'>
-            <h3>🎵 ${fileName} <span class='format-badge'>音频</span></h3>
-            <p>格式: ${extension.toUpperCase()} | 支持范围请求和流式传输</p>
-            <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载音频</a>
-        </div>
-        <div class='player-container'>
-            <audio class='audio-player' controls autoplay preload=""auto"">
-                <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='${contentType}'>
-                您的浏览器不支持音频播放。
-            </audio>
-            <div class='controls'>
-                <button class='control-btn' onclick='toggleAudioMute()'>静音</button>
-            </div>
-        </div>
-    `;
-    document.getElementById('player-content').innerHTML = content;
-}
+        // 修改音频加载函数 - 使用预览端点
+        function loadAudioFile(path) {
+            const fileName = path.split('/').pop();
+            const extension = fileName.split('.').pop().toLowerCase();
+            const contentType = getAudioContentType(extension);
+            
+            const content = `
+                <div class='file-info'>
+                    <h3>🎵 ${fileName} <span class='format-badge'>音频</span></h3>
+                    <p>格式: ${extension.toUpperCase()} | 支持范围请求和流式传输</p>
+                    <a href='/api/fileserver/download/${encodeURIComponent(path)}' class='download-btn'>📥 下载音频</a>
+                </div>
+                <div class='player-container'>
+                    <audio class='audio-player' controls autoplay preload=""auto"">
+                        <source src='/api/fileserver/preview/${encodeURIComponent(path)}' type='${contentType}'>
+                        您的浏览器不支持音频播放。
+                    </audio>
+                    <div class='controls'>
+                        <button class='control-btn' onclick='toggleAudioMute()'>静音</button>
+                    </div>
+                </div>
+            `;
+            document.getElementById('player-content').innerHTML = content;
+        }
 
         // 视频静音切换
         function toggleMute() {
@@ -781,36 +824,7 @@ function loadAudioFile(path) {
     </script>
 </body>
 </html>";
-
-    context.Response.ContentType = "text/html; charset=utf-8";
-    await context.Response.WriteAsync(html);
-});
-
-// 健康检查端点
-app.MapGet("/health", async context =>
-{
-    var statusService = context.RequestServices.GetRequiredService<IServerStatusService>();
-    statusService.IncrementRequests();
-
-    var status = statusService.GetStatus();
-    var health = new HealthResponse
-    {
-        Status = status.IsRunning ? "healthy" : "unhealthy",
-        Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-        ActiveConnections = status.ActiveConnections,
-        Uptime = status.Uptime
-    };
-
-    context.Response.ContentType = "application/json";
-    await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(health));
-});
-
-Console.WriteLine("🚀 文件服务器启动成功!");
-Console.WriteLine($"🌐 HTTP 访问: http://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpPort", 8080)}");
-Console.WriteLine($"🔒 HTTPS 访问: https://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
-Console.WriteLine($"📡 内网访问: https://{GetLocalIPAddress()}:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
-
-app.Run();
+}
 
 // 创建并信任开发者证书的方法
 static X509Certificate2? CreateAndTrustDeveloperCertificate()

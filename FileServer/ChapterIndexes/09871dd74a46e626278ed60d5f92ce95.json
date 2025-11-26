@@ -2,13 +2,157 @@
   "FilePath": "data/\u6587\u672C/\u540D\u8457/1984.txt",
   "FileSize": 503566,
   "FileLastModified": "2025-11-25T17:54:36.526108+08:00",
-  "IndexTime": "2025-11-26T08:14:27.6198352+08:00",
-  "TotalChapters": 1,
+  "IndexTime": "2025-11-26T13:26:18.4716605+08:00",
+  "TotalChapters": 25,
   "Chapters": [
     {
-      "Title": "\u4E00\u3001\u4E8C\u3001\u4E09\u3001\u56DB!\u540C\u5FD7\u4EEC\uFF0C\u62FF\u51FA\u7CBE\u795E\u6765!\u4E00\u3001\u4E8C\u3001\u4E09\u3001\u56DB!",
+      "Title": "\u7528\u6237\u4E0A\u4F20\u4E4B\u5185\u5BB9\u5F00\u59CB",
       "Page": 1,
-      "LineNumber": 591,
+      "LineNumber": 1,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C1\u8282",
+      "Page": 1,
+      "LineNumber": 55,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C2\u8282",
+      "Page": 1,
+      "LineNumber": 325,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C3\u8282",
+      "Page": 1,
+      "LineNumber": 535,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C4\u8282",
+      "Page": 1,
+      "LineNumber": 665,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C5\u8282",
+      "Page": 1,
+      "LineNumber": 799,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C6\u8282",
+      "Page": 2,
+      "LineNumber": 1101,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C7\u8282",
+      "Page": 2,
+      "LineNumber": 1167,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E00\u90E8 \u7B2C8\u8282",
+      "Page": 2,
+      "LineNumber": 1325,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C1\u8282",
+      "Page": 2,
+      "LineNumber": 1647,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C2\u8282",
+      "Page": 2,
+      "LineNumber": 1929,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C3\u8282",
+      "Page": 3,
+      "LineNumber": 2195,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C4\u8282",
+      "Page": 3,
+      "LineNumber": 2433,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C5\u8282",
+      "Page": 3,
+      "LineNumber": 2743,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C6\u8282",
+      "Page": 3,
+      "LineNumber": 2857,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C7\u8282",
+      "Page": 3,
+      "LineNumber": 2931,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C8\u8282",
+      "Page": 4,
+      "LineNumber": 3065,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C9\u8282",
+      "Page": 4,
+      "LineNumber": 3407,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u90E8 \u7B2C10\u8282",
+      "Page": 4,
+      "LineNumber": 3825,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C1\u8282",
+      "Page": 5,
+      "LineNumber": 4003,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C2\u8282",
+      "Page": 5,
+      "LineNumber": 4413,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C3\u8282",
+      "Page": 6,
+      "LineNumber": 5107,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C4\u8282",
+      "Page": 6,
+      "LineNumber": 5501,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C5\u8282",
+      "Page": 6,
+      "LineNumber": 5687,
+      "Preview": ""
+    },
+    {
+      "Title": "\u7B2C\u4E09\u90E8 \u7B2C6\u8282",
+      "Page": 6,
+      "LineNumber": 5829,
       "Preview": ""
     }
   ]
