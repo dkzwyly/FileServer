@@ -7,6 +7,7 @@ using System.Text;
 
 namespace FileServer.Controllers
 {
+
     [ApiController]
     [Route("api/[controller]")]
     public class FileServerController : ControllerBase
@@ -16,18 +17,22 @@ namespace FileServer.Controllers
         private readonly ILogger<FileServerController> _logger;
         private readonly IConfiguration _configuration;
         private readonly IMemoryMappedFileService _memoryMappedService;
+        private readonly IChapterIndexService _chapterIndexService;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
                                   ILogger<FileServerController> logger,
                                   IConfiguration configuration,
-                                  IMemoryMappedFileService memoryMappedService)
+                                  IMemoryMappedFileService memoryMappedService,
+                                  IChapterIndexService chapterIndexService)
+
         {
             _fileService = fileService;
             _statusService = statusService;
             _logger = logger;
             _configuration = configuration;
             _memoryMappedService = memoryMappedService;
+            _chapterIndexService = chapterIndexService;
         }
 
         [HttpGet("status")]
@@ -703,12 +708,10 @@ namespace FileServer.Controllers
                     string content;
                     if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
                     {
-                        // 有 BOM，跳过前3个字节
                         content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
                     }
                     else
                     {
-                        // 无 BOM，直接转换
                         content = Encoding.UTF8.GetString(fileBytes);
                     }
 
@@ -719,7 +722,7 @@ namespace FileServer.Controllers
                     // 计算分页
                     if (page < 1) page = 1;
                     if (pageSize < 1) pageSize = 1000;
-                    if (pageSize > 10000) pageSize = 10000; // 限制最大页大小
+                    if (pageSize > 10000) pageSize = 10000;
 
                     var totalPages = (int)Math.Ceiling((double)totalLines / pageSize);
                     var startIndex = (page - 1) * pageSize;
@@ -729,15 +732,25 @@ namespace FileServer.Controllers
                     var pageLines = new List<string>();
                     for (int i = startIndex; i < endIndex; i++)
                     {
-                        pageLines.Add(lines[i].TrimEnd('\r')); // 移除可能的 \r 字符
+                        pageLines.Add(lines[i].TrimEnd('\r'));
                     }
 
                     var pageContent = string.Join("\n", pageLines);
 
+                    // 获取或构建章节索引（只在第一页请求时构建，避免重复工作）
+                    ChapterIndex chapterIndex = null;
+                    if (page == 1)
+                    {
+                        chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
+                        _logger.LogInformation("章节索引处理完成: {FileName}, 章节数: {ChapterCount}",
+                            fileName, chapterIndex?.TotalChapters ?? 0);
+                    }
+
                     _logger.LogInformation("文本文件分页预览 - 文件: {FileName}, 页码: {Page}, 页大小: {PageSize}, 总行数: {TotalLines}, 总页数: {TotalPages}",
                         fileName, page, pageSize, totalLines, totalPages);
 
-                    return Ok(new
+                    // 构建响应对象
+                    var response = new
                     {
                         type = "text",
                         fileName,
@@ -760,13 +773,98 @@ namespace FileServer.Controllers
                             lines = totalLines,
                             hasBom = fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF
                         }
-                    });
+                    };
+
+                    // 如果有章节信息，添加到响应中
+                    if (chapterIndex != null)
+                    {
+                        var responseWithChapters = new
+                        {
+                            response.type,
+                            response.fileName,
+                            response.content,
+                            response.encoding,
+                            response.pagination,
+                            response.fileInfo,
+                            chapters = new
+                            {
+                                total = chapterIndex.TotalChapters,
+                                list = chapterIndex.Chapters.Select(c => new
+                                {
+                                    title = c.Title,
+                                    page = c.Page,
+                                    line = c.LineNumber,
+                                    preview = c.Preview
+                                }).ToArray()
+                            }
+                        };
+
+                        return Ok(responseWithChapters);
+                    }
+
+                    return Ok(response);
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "文本文件预览失败");
                 return StatusCode(500, new { error = "文本文件预览失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("chapters/{*path}")]
+        public async Task<IActionResult> GetFileChapters(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+
+                using (stream)
+                {
+                    byte[] fileBytes;
+                    using (var memoryStream = new MemoryStream())
+                    {
+                        await stream.CopyToAsync(memoryStream);
+                        fileBytes = memoryStream.ToArray();
+                    }
+
+                    string content;
+                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
+                    }
+                    else
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes);
+                    }
+
+                    var chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
+
+                    if (chapterIndex == null)
+                    {
+                        return NotFound(new { error = "无法构建章节索引" });
+                    }
+
+                    return Ok(new
+                    {
+                        fileName,
+                        totalChapters = chapterIndex.TotalChapters,
+                        chapters = chapterIndex.Chapters.Select(c => new
+                        {
+                            title = c.Title,
+                            page = c.Page,
+                            line = c.LineNumber,
+                            preview = c.Preview
+                        })
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取章节列表失败: {Path}", path);
+                return StatusCode(500, new { error = "获取章节列表失败", message = ex.Message });
             }
         }
 

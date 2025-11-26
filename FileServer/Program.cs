@@ -21,6 +21,9 @@ builder.Services.AddScoped<IFileService, FileService>();
 // 添加内存映射服务
 builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
 
+// 在依赖注入容器中注册章节索引服务
+builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
+
 // 添加控制器
 builder.Services.AddControllers();
 
