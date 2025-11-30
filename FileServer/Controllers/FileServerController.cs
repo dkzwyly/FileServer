@@ -7,7 +7,6 @@ using System.Text;
 
 namespace FileServer.Controllers
 {
-
     [ApiController]
     [Route("api/[controller]")]
     public class FileServerController : ControllerBase
@@ -18,14 +17,15 @@ namespace FileServer.Controllers
         private readonly IConfiguration _configuration;
         private readonly IMemoryMappedFileService _memoryMappedService;
         private readonly IChapterIndexService _chapterIndexService;
+        private readonly IVideoThumbnailService _videoThumbnailService;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
                                   ILogger<FileServerController> logger,
                                   IConfiguration configuration,
                                   IMemoryMappedFileService memoryMappedService,
-                                  IChapterIndexService chapterIndexService)
-
+                                  IChapterIndexService chapterIndexService,
+                                  IVideoThumbnailService videoThumbnailService) 
         {
             _fileService = fileService;
             _statusService = statusService;
@@ -33,6 +33,7 @@ namespace FileServer.Controllers
             _configuration = configuration;
             _memoryMappedService = memoryMappedService;
             _chapterIndexService = chapterIndexService;
+            _videoThumbnailService = videoThumbnailService;
         }
 
         [HttpGet("status")]
@@ -356,12 +357,6 @@ namespace FileServer.Controllers
             }
         }
 
-        private bool IsImageFile(string extension)
-        {
-            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
-            return imageExtensions.Contains(extension.ToLowerInvariant());
-        }
-
         [HttpGet("stream/{*path}")]
         public async Task<IActionResult> StreamFile(string path)
         {
@@ -405,6 +400,198 @@ namespace FileServer.Controllers
                 _statusService.DecrementConnections();
             }
         }
+
+        #region 章节相关端点
+
+        [HttpGet("chapters/{*path}")]
+        public async Task<IActionResult> GetFileChapters(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                // 添加 URL 解码
+                path = WebUtility.UrlDecode(path);
+                _logger.LogInformation("处理章节请求 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
+                    Request.Path.Value, path);
+
+                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+
+                using (stream)
+                {
+                    byte[] fileBytes;
+                    using (var memoryStream = new MemoryStream())
+                    {
+                        await stream.CopyToAsync(memoryStream);
+                        fileBytes = memoryStream.ToArray();
+                    }
+
+                    string content;
+                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
+                    }
+                    else
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes);
+                    }
+
+                    var chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
+
+                    if (chapterIndex == null)
+                    {
+                        return NotFound(new { error = "无法构建章节索引" });
+                    }
+
+                    return Ok(new
+                    {
+                        fileName,
+                        totalChapters = chapterIndex.TotalChapters,
+                        chapters = chapterIndex.Chapters.Select(c => new
+                        {
+                            title = c.Title,
+                            page = c.Page,
+                            lineNumber = c.LineNumber,
+                            preview = c.Preview
+                        })
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取章节列表失败: {Path}", path);
+                return StatusCode(500, new { error = "获取章节列表失败", message = ex.Message });
+            }
+        }
+
+        [HttpPost("chapters/rebuild/{*path}")]
+        public async Task<IActionResult> RebuildChapterIndex(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                // 添加 URL 解码
+                path = WebUtility.UrlDecode(path);
+                _logger.LogInformation("重建章节索引 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
+                    Request.Path.Value, path);
+
+                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+
+                using (stream)
+                {
+                    byte[] fileBytes;
+                    using (var memoryStream = new MemoryStream())
+                    {
+                        await stream.CopyToAsync(memoryStream);
+                        fileBytes = memoryStream.ToArray();
+                    }
+
+                    string content;
+                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
+                    }
+                    else
+                    {
+                        content = Encoding.UTF8.GetString(fileBytes);
+                    }
+
+                    var chapterIndex = await _chapterIndexService.ForceRebuildChapterIndexAsync(path, content);
+
+                    return Ok(new
+                    {
+                        success = true,
+                        message = "章节索引重建完成",
+                        fileName,
+                        totalChapters = chapterIndex.TotalChapters,
+                        chapters = chapterIndex.Chapters.Select(c => new
+                        {
+                            title = c.Title,
+                            page = c.Page,
+                            lineNumber = c.LineNumber,
+                            preview = c.Preview
+                        })
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "重建章节索引失败: {Path}", path);
+                return StatusCode(500, new { error = "重建章节索引失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("chapters/info/{*path}")]
+        public IActionResult GetChapterIndexInfo(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                // 添加 URL 解码
+                path = WebUtility.UrlDecode(path);
+                _logger.LogInformation("获取章节索引信息 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
+                    Request.Path.Value, path);
+
+                var info = _chapterIndexService.GetIndexFileInfo(path);
+                return Ok(new { info });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取章节索引信息失败: {Path}", path);
+                return StatusCode(500, new { error = "获取章节索引信息失败", message = ex.Message });
+            }
+        }
+
+        [HttpDelete("chapters/{*path}")]
+        public IActionResult DeleteChapterIndex(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                // 添加 URL 解码
+                path = WebUtility.UrlDecode(path);
+                _logger.LogInformation("删除章节索引 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
+                    Request.Path.Value, path);
+
+                var result = _chapterIndexService.DeleteChapterIndex(path);
+
+                if (result)
+                {
+                    return Ok(new { success = true, message = "章节索引删除成功" });
+                }
+                else
+                {
+                    return NotFound(new { error = "章节索引文件不存在" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除章节索引失败: {Path}", path);
+                return StatusCode(500, new { error = "删除章节索引失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("chapters/admin/all")]
+        public IActionResult GetAllChapterIndexes()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                var infos = _chapterIndexService.GetAllIndexFilesInfo();
+                return Ok(new { indexFiles = infos });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取所有章节索引信息失败");
+                return StatusCode(500, new { error = "获取所有章节索引信息失败", message = ex.Message });
+            }
+        }
+
+        #endregion
 
         #region 私有方法 - 高性能文件传输
 
@@ -811,63 +998,221 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "文本文件预览失败", message = ex.Message });
             }
         }
-
-        [HttpGet("chapters/{*path}")]
-        public async Task<IActionResult> GetFileChapters(string path)
+        // 添加视频缩略图端点
+        [HttpPost("video-thumbnail/generate")]
+        public async Task<IActionResult> GenerateVideoThumbnail([FromBody] VideoThumbnailRequest request)
         {
             try
             {
                 _statusService.IncrementRequests();
 
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
-
-                using (stream)
+                if (string.IsNullOrEmpty(request.VideoPath))
                 {
-                    byte[] fileBytes;
-                    using (var memoryStream = new MemoryStream())
-                    {
-                        await stream.CopyToAsync(memoryStream);
-                        fileBytes = memoryStream.ToArray();
-                    }
+                    return BadRequest(new { error = "视频路径不能为空" });
+                }
 
-                    string content;
-                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
-                    }
-                    else
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes);
-                    }
+                // URL 解码路径
+                request.VideoPath = WebUtility.UrlDecode(request.VideoPath);
 
-                    var chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
+                _logger.LogInformation("生成视频缩略图请求: {VideoPath}, 位置: {Position}%, 尺寸: {Width}x{Height}",
+                    request.VideoPath, request.PositionPercentage, request.Width, request.Height);
 
-                    if (chapterIndex == null)
-                    {
-                        return NotFound(new { error = "无法构建章节索引" });
-                    }
+                var result = await _videoThumbnailService.GenerateThumbnailAsync(request);
 
+                if (result.Success)
+                {
                     return Ok(new
                     {
-                        fileName,
-                        totalChapters = chapterIndex.TotalChapters,
-                        chapters = chapterIndex.Chapters.Select(c => new
-                        {
-                            title = c.Title,
-                            page = c.Page,
-                            line = c.LineNumber,
-                            preview = c.Preview
-                        })
+                        success = true,
+                        thumbnailPath = result.ThumbnailPath,
+                        positionPercentage = result.PositionPercentage,
+                        // 使用格式化属性或手动处理可空类型
+                        videoDuration = result.VideoDuration.HasValue ?
+                            result.VideoDuration.Value.ToString(@"hh\:mm\:ss") : "未知",
+                        thumbnailTime = result.ThumbnailTime.HasValue ?
+                            result.ThumbnailTime.Value.ToString(@"hh\:mm\:ss") : "未知",
+                        // 或者直接使用模型中的格式化属性
+                        videoDurationFormatted = result.VideoDurationFormatted,
+                        thumbnailTimeFormatted = result.ThumbnailTimeFormatted,
+                        message = result.Message
+                    });
+                }
+                else
+                {
+                    return BadRequest(new
+                    {
+                        success = false,
+                        message = result.Message
                     });
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "获取章节列表失败: {Path}", path);
-                return StatusCode(500, new { error = "获取章节列表失败", message = ex.Message });
+                _logger.LogError(ex, "生成视频缩略图失败: {VideoPath}", request?.VideoPath);
+                return StatusCode(500, new { error = "生成视频缩略图失败", message = ex.Message });
             }
         }
 
+        [HttpGet("video-thumbnail/{*path}")]
+        public async Task<IActionResult> GetVideoThumbnail(string path, [FromQuery] int width = 320, [FromQuery] int height = 180)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                path = WebUtility.UrlDecode(path);
+
+                // 添加路径验证
+                if (string.IsNullOrEmpty(path))
+                {
+                    _logger.LogWarning("视频缩略图请求路径为空");
+                    return await GetPlaceholderThumbnail(width, height);
+                }
+
+                var extension = Path.GetExtension(path).ToLowerInvariant();
+
+                _logger.LogInformation("视频缩略图请求 - 路径: {Path}, 扩展名: {Extension}", path, extension);
+
+                // 检查是否为视频文件
+                if (!_videoThumbnailService.IsVideoFile(extension))
+                {
+                    _logger.LogWarning("非视频文件请求缩略图: {Path}", path);
+                    return await GetPlaceholderThumbnail(width, height);
+                }
+
+                // 检查视频文件是否存在
+                if (!await _fileService.FileExistsAsync(path))
+                {
+                    _logger.LogWarning("视频文件不存在: {Path}", path);
+                    return await GetPlaceholderThumbnail(width, height);
+                }
+
+                // 检查缩略图是否已生成
+                var thumbnailPath = _videoThumbnailService.GetThumbnailPath(path, width, height);
+
+                if (string.IsNullOrEmpty(thumbnailPath) || !System.IO.File.Exists(thumbnailPath))
+                {
+                    // 缩略图不存在，加入生成队列
+                    _videoThumbnailService.QueueVideoForGeneration(path);
+
+                    _logger.LogInformation("缩略图不存在，已加入生成队列: {Path}", path);
+
+                    // 返回占位图而不是404
+                    return await GetPlaceholderThumbnail(width, height);
+                }
+
+                // 返回缩略图文件
+                var stream = await _videoThumbnailService.GetThumbnailStreamAsync(thumbnailPath);
+
+                if (stream == null)
+                {
+                    _logger.LogWarning("缩略图文件读取失败，返回占位图: {Path}", path);
+                    return await GetPlaceholderThumbnail(width, height);
+                }
+
+                Response.Headers.Append("Cache-Control", "public, max-age=86400"); // 缓存1天
+                Response.Headers.Append("Content-Disposition", $"inline; filename=\"{WebUtility.UrlEncode(Path.GetFileName(thumbnailPath))}\"");
+
+                _logger.LogInformation("成功返回视频缩略图: {Path}", path);
+
+                return File(stream, "image/jpeg");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取视频缩略图失败: {Path}", path);
+                // 发生异常时返回占位图
+                return await GetPlaceholderThumbnail(width, height);
+            }
+        }
+
+        // 添加占位图生成方法
+        private async Task<IActionResult> GetPlaceholderThumbnail(int width, int height)
+        {
+            try
+            {
+                // 生成简单的占位图
+                var svgContent = $@"<svg width='{width}' height='{height}' xmlns='http://www.w3.org/2000/svg'>
+                    <rect width='100%' height='100%' fill='#2F4F4F'/>
+                    <text x='50%' y='50%' font-family='Arial' font-size='{Math.Min(width, height) / 10}' 
+                          fill='white' text-anchor='middle' dominant-baseline='middle'>Video Thumbnail</text>
+                    <polygon points='{width/2-20},{height/2-20} {width/2+20},{height/2} {width/2-20},{height/2+20}' 
+                          fill='white'/>
+                </svg>";
+
+                var svgBytes = System.Text.Encoding.UTF8.GetBytes(svgContent);
+                var stream = new MemoryStream(svgBytes);
+
+                Response.Headers.Append("Cache-Control", "no-cache, no-store");
+                return File(stream, "image/svg+xml");
+            }
+            catch
+            {
+                // 如果SVG生成失败，返回空的图片
+                return NotFound();
+            }
+        }
+
+        // 添加状态查询端点
+        [HttpGet("video-thumbnail/status")]
+        public IActionResult GetThumbnailGenerationStatus()
+        {
+            try
+            {
+                var status = _videoThumbnailService.GetGenerationStatus();
+
+                return Ok(new
+                {
+                    queueLength = status.QueueLength,
+                    generatedCount = status.GeneratedCount,
+                    isRunning = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取缩略图生成状态失败");
+                return StatusCode(500, new { error = "获取状态失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("video-info/{*path}")]
+        public async Task<IActionResult> GetVideoInfo(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                path = WebUtility.UrlDecode(path);
+                var extension = Path.GetExtension(path).ToLowerInvariant();
+
+                if (!_videoThumbnailService.IsVideoFile(extension))
+                {
+                    return BadRequest(new { error = "非视频文件" });
+                }
+
+                if (!await _videoThumbnailService.VideoFileExistsAsync(path))
+                {
+                    return NotFound(new { error = "视频文件不存在" });
+                }
+
+                var duration = await _videoThumbnailService.GetVideoDurationAsync(path);
+                var fileInfo = await _fileService.GetFileInfoAsync(path);
+
+                return Ok(new
+                {
+                    fileName = fileInfo.Name,
+                    fileSize = fileInfo.Size,
+                    fileSizeFormatted = fileInfo.SizeFormatted,
+                    duration = duration?.ToString(@"hh\:mm\:ss"),
+                    durationSeconds = duration?.TotalSeconds,
+                    supportedForThumbnail = duration != null
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取视频信息失败: {Path}", path);
+                return StatusCode(500, new { error = "获取视频信息失败", message = ex.Message });
+            }
+        }
         private string FormatUptime(long uptimeInMilliseconds)
         {
             var uptime = TimeSpan.FromMilliseconds(uptimeInMilliseconds);
@@ -910,6 +1255,12 @@ namespace FileServer.Controllers
             return textExtensions.Contains(extension.ToLowerInvariant());
         }
 
+        private bool IsImageFile(string extension)
+        {
+            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
+            return imageExtensions.Contains(extension.ToLowerInvariant());
+        }
+
         #endregion
     }
 
@@ -917,8 +1268,7 @@ namespace FileServer.Controllers
     {
         public static string GetRootPath(this IFileService fileService)
         {
-            return @"D:\FileServer";
+            return @"E:\FileServer";
         }
     }
-
 }

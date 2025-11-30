@@ -2,7 +2,7 @@
 {
     public class FileServerConfig
     {
-        public string RootPath { get; set; } = @"D:\FileServer";
+        public string RootPath { get; set; } = @"E:\FileServer";
         public int HttpPort { get; set; } = 8080;
         public int HttpsPort { get; set; } = 8081;
         public int QuicPort { get; set; } = 8082;

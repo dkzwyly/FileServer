@@ -4,29 +4,34 @@ using FileServer.Middleware;
 using System.Security.Cryptography.X509Certificates;
 using System.Diagnostics;
 
+
 var builder = WebApplication.CreateBuilder(args);
 
 // 配置服务
 builder.Services.Configure<FileServerConfig>(
     builder.Configuration.GetSection("FileServer"));
 
-// 添加服务
-builder.Services.AddSingleton<IServerStatusService, ServerStatusService>();
-
-// 添加缩略图服务
+// 修复服务注册 - 确保只注册一次
+builder.Services.AddScoped<IServerStatusService, ServerStatusService>();
 builder.Services.AddScoped<IThumbnailService, ThumbnailService>();
-
-// 更新文件服务注册（确保传递 thumbnailService）
 builder.Services.AddScoped<IFileService, FileService>();
-// 添加内存映射服务
 builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
-
-// 在依赖注入容器中注册章节索引服务
 builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
+
+// 关键修复：正确注册 VideoThumbnailService
+// 方法1：作为 HostedService 注册
+builder.Services.AddSingleton<VideoThumbnailService>();
+builder.Services.AddSingleton<IHostedService>(provider =>
+    provider.GetRequiredService<VideoThumbnailService>());
+builder.Services.AddSingleton<IVideoThumbnailService>(provider =>
+    provider.GetRequiredService<VideoThumbnailService>());
+
+// 或者方法2：分开注册（推荐）
+// builder.Services.AddSingleton<IVideoThumbnailService, VideoThumbnailService>();
+// builder.Services.AddSingleton<IHostedService, VideoThumbnailService>();
 
 // 添加控制器
 builder.Services.AddControllers();
-
 // 创建并信任开发者证书
 var certificate = CreateAndTrustDeveloperCertificate();
 if (certificate != null)
