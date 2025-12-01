@@ -1213,6 +1213,415 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取视频信息失败", message = ex.Message });
             }
         }
+        #region 歌词相关端点
+
+        [HttpPost("lyrics/mapping")]
+        public async Task<IActionResult> SaveLyricsMapping([FromBody] LyricsMappingRequest request)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                if (string.IsNullOrEmpty(request.SongPath))
+                {
+                    return BadRequest(new { error = "歌曲路径不能为空" });
+                }
+
+                // URL 解码路径
+                request.SongPath = WebUtility.UrlDecode(request.SongPath);
+                request.LyricsPath = WebUtility.UrlDecode(request.LyricsPath);
+
+                _logger.LogInformation("保存歌词映射 - 歌曲: {SongPath}, 歌词: {LyricsPath}",
+                    request.SongPath, request.LyricsPath);
+
+                // 检查歌曲文件是否存在
+                if (!await _fileService.FileExistsAsync(request.SongPath))
+                {
+                    return NotFound(new { error = "歌曲文件不存在" });
+                }
+
+                // 特殊处理：标记为无歌词
+                if (request.LyricsPath == "NO_LYRICS")
+                {
+                    // 保存无歌词标记
+                    var result = await SaveLyricsMappingToFile(request);
+
+                    if (result)
+                    {
+                        _logger.LogInformation("标记歌曲为无歌词: {SongPath}", request.SongPath);
+                        return Ok(new { success = true, message = "歌曲已标记为无歌词" });
+                    }
+                    else
+                    {
+                        return StatusCode(500, new { error = "标记无歌词失败" });
+                    }
+                }
+
+                // 正常歌词文件映射
+                if (string.IsNullOrEmpty(request.LyricsPath))
+                {
+                    return BadRequest(new { error = "歌词路径不能为空" });
+                }
+
+                // 检查歌词文件是否存在
+                if (!await _fileService.FileExistsAsync(request.LyricsPath))
+                {
+                    return NotFound(new { error = "歌词文件不存在" });
+                }
+
+                // 保存映射到数据库或文件
+                var saveResult = await SaveLyricsMappingToFile(request);
+
+                if (saveResult)
+                {
+                    return Ok(new { success = true, message = "歌词映射保存成功" });
+                }
+                else
+                {
+                    return StatusCode(500, new { error = "保存歌词映射失败" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存歌词映射失败");
+                return StatusCode(500, new { error = "保存歌词映射失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("lyrics/{*songPath}")]
+        public async Task<IActionResult> GetLyrics(string songPath)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                songPath = WebUtility.UrlDecode(songPath);
+                _logger.LogInformation("获取歌词 - 歌曲路径: {SongPath}", songPath);
+
+                // 1. 首先查找映射的歌词文件
+                var mappedLyricsPath = await GetMappedLyricsPath(songPath);
+
+                if (!string.IsNullOrEmpty(mappedLyricsPath))
+                {
+                    // 检查是否为无歌词标记
+                    if (mappedLyricsPath == "NO_LYRICS")
+                    {
+                        _logger.LogInformation("歌曲标记为无歌词: {SongPath}", songPath);
+                        return Ok(new
+                        {
+                            type = "no_lyrics",
+                            message = "此歌曲已标记为无歌词"
+                        });
+                    }
+
+                    _logger.LogInformation("找到映射的歌词文件: {LyricsPath}", mappedLyricsPath);
+                    return await GetLyricsContent(mappedLyricsPath);
+                }
+
+                // 2. 如果没有映射，尝试在同目录下查找同名的.lrc文件
+                var directory = Path.GetDirectoryName(songPath);
+                var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(songPath);
+                var possibleLyricsPath = Path.Combine(directory, fileNameWithoutExtension + ".lrc");
+
+                if (await _fileService.FileExistsAsync(possibleLyricsPath))
+                {
+                    _logger.LogInformation("找到同名歌词文件: {LyricsPath}", possibleLyricsPath);
+                    return await GetLyricsContent(possibleLyricsPath);
+                }
+
+                // 3. 查找同目录下其他歌词文件
+                var lyricsFiles = await FindLyricsFilesInDirectory(directory);
+                if (lyricsFiles.Any())
+                {
+                    _logger.LogInformation("在目录中找到 {Count} 个歌词文件", lyricsFiles.Count);
+                    return Ok(new
+                    {
+                        type = "available_files",
+                        files = lyricsFiles,
+                        message = "请选择歌词文件"
+                    });
+                }
+
+                _logger.LogWarning("未找到歌词文件: {SongPath}", songPath);
+                return NotFound(new { error = "未找到歌词文件" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取歌词失败: {SongPath}", songPath);
+                return StatusCode(500, new { error = "获取歌词失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("lyrics/files/{*directory}")]
+        public async Task<IActionResult> GetLyricsFiles(string directory)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                directory = WebUtility.UrlDecode(directory);
+                _logger.LogInformation("获取目录中的歌词文件: {Directory}", directory);
+
+                var lyricsFiles = await FindLyricsFilesInDirectory(directory);
+
+                return Ok(new
+                {
+                    directory,
+                    lyricsFiles = lyricsFiles,
+                    count = lyricsFiles.Count
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取歌词文件列表失败: {Directory}", directory);
+                return StatusCode(500, new { error = "获取歌词文件列表失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("lyrics/mapping/{*songPath}")]
+        public async Task<IActionResult> GetLyricsMapping(string songPath)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                songPath = WebUtility.UrlDecode(songPath);
+                _logger.LogInformation("获取歌词映射: {SongPath}", songPath);
+
+                var mappedLyricsPath = await GetMappedLyricsPath(songPath);
+
+                if (!string.IsNullOrEmpty(mappedLyricsPath))
+                {
+                    // 处理无歌词标记
+                    if (mappedLyricsPath == "NO_LYRICS")
+                    {
+                        return Ok(new
+                        {
+                            songPath,
+                            lyricsPath = "NO_LYRICS",
+                            lyricsFileName = "无歌词",
+                            exists = false,
+                            isNoLyrics = true
+                        });
+                    }
+
+                    return Ok(new
+                    {
+                        songPath,
+                        lyricsPath = mappedLyricsPath,
+                        lyricsFileName = Path.GetFileName(mappedLyricsPath),
+                        exists = await _fileService.FileExistsAsync(mappedLyricsPath),
+                        isNoLyrics = false
+                    });
+                }
+
+                return NotFound(new { error = "未找到歌词映射" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取歌词映射失败: {SongPath}", songPath);
+                return StatusCode(500, new { error = "获取歌词映射失败", message = ex.Message });
+            }
+        }
+
+        [HttpDelete("lyrics/mapping/{*songPath}")]
+        public async Task<IActionResult> DeleteLyricsMapping(string songPath)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                songPath = WebUtility.UrlDecode(songPath);
+                _logger.LogInformation("删除歌词映射: {SongPath}", songPath);
+
+                var result = await DeleteLyricsMappingFromFile(songPath);
+
+                if (result)
+                {
+                    return Ok(new { success = true, message = "歌词映射删除成功" });
+                }
+                else
+                {
+                    return NotFound(new { error = "未找到歌词映射" });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除歌词映射失败: {SongPath}", songPath);
+                return StatusCode(500, new { error = "删除歌词映射失败", message = ex.Message });
+            }
+        }
+
+        #endregion
+
+        #region 私有方法 - 歌词功能
+
+        private async Task<bool> SaveLyricsMappingToFile(LyricsMappingRequest request)
+        {
+            try
+            {
+                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+                Dictionary<string, string> mappings = new Dictionary<string, string>();
+
+                // 读取现有的映射文件
+                if (System.IO.File.Exists(mappingFilePath))
+                {
+                    var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
+                    mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+                              ?? new Dictionary<string, string>();
+                }
+
+                // 添加或更新映射
+                mappings[request.SongPath] = request.LyricsPath;
+
+                // 保存回文件
+                var newJson = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                await System.IO.File.WriteAllTextAsync(mappingFilePath, newJson);
+
+                _logger.LogInformation("歌词映射保存成功: {SongPath} -> {LyricsPath}", request.SongPath, request.LyricsPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存歌词映射到文件失败");
+                return false;
+            }
+        }
+
+        private async Task<string> GetMappedLyricsPath(string songPath)
+        {
+            try
+            {
+                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+
+                if (!System.IO.File.Exists(mappingFilePath))
+                {
+                    return null;
+                }
+
+                var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
+                var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+
+                if (mappings != null && mappings.TryGetValue(songPath, out var lyricsPath))
+                {
+                    return lyricsPath;
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取映射歌词路径失败");
+                return null;
+            }
+        }
+
+        private async Task<bool> DeleteLyricsMappingFromFile(string songPath)
+        {
+            try
+            {
+                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+
+                if (!System.IO.File.Exists(mappingFilePath))
+                {
+                    return false;
+                }
+
+                var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
+                var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+
+                if (mappings != null && mappings.Remove(songPath))
+                {
+                    var newJson = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
+                    {
+                        WriteIndented = true
+                    });
+                    await System.IO.File.WriteAllTextAsync(mappingFilePath, newJson);
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除歌词映射失败");
+                return false;
+            }
+        }
+
+        private async Task<IActionResult> GetLyricsContent(string lyricsPath)
+        {
+            try
+            {
+                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(lyricsPath);
+
+                using (stream)
+                using (var reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    var content = await reader.ReadToEndAsync();
+
+                    return Ok(new
+                    {
+                        type = "lyrics_content",
+                        lyricsPath,
+                        fileName,
+                        content,
+                        encoding = "utf-8"
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取歌词内容失败: {LyricsPath}", lyricsPath);
+                return StatusCode(500, new { error = "获取歌词内容失败", message = ex.Message });
+            }
+        }
+
+        private async Task<List<LyricsFileInfo>> FindLyricsFilesInDirectory(string directory)
+        {
+            var lyricsFiles = new List<LyricsFileInfo>();
+
+            try
+            {
+                var fileListResponse = await _fileService.GetFileListAsync(directory);
+
+                // 修复：遍历 Files 列表而不是 FileListResponse 对象
+                foreach (var file in fileListResponse.Files)
+                {
+                    if (IsLyricsFile(file.Name))
+                    {
+                        lyricsFiles.Add(new LyricsFileInfo
+                        {
+                            Path = file.Path,
+                            Name = file.Name,
+                            Size = file.Size,
+                            SizeFormatted = file.SizeFormatted,
+                            ModifiedTime = file.LastModified
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "查找歌词文件失败: {Directory}", directory);
+            }
+
+            return lyricsFiles;
+        }
+
+        private bool IsLyricsFile(string fileName)
+        {
+            var extension = Path.GetExtension(fileName).ToLowerInvariant();
+            var lyricsExtensions = new[] { ".lrc", ".txt", ".srt", ".ass", ".ssa" };
+            return lyricsExtensions.Contains(extension);
+        }
+
+        #endregion
+
+
         private string FormatUptime(long uptimeInMilliseconds)
         {
             var uptime = TimeSpan.FromMilliseconds(uptimeInMilliseconds);
