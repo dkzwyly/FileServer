@@ -1,6 +1,7 @@
 ﻿using FileServer.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
@@ -11,12 +12,13 @@ namespace FileServer.Services
     {
         private readonly IServiceScopeFactory _serviceScopeFactory;
         private readonly ILogger<VideoThumbnailService> _logger;
+        private readonly FileServerConfig _config;
         private string _thumbnailsRoot;
         private readonly ConcurrentDictionary<string, byte> _processingVideos;
         private readonly ConcurrentQueue<string> _generationQueue;
         private readonly CancellationTokenSource _cancellationTokenSource;
         private Task[] _workerTasks;
-        private const int MAX_CONCURRENT_WORKERS = 4;
+        private int _maxConcurrentWorkers;
 
         private int _generatedCount = 0;
         private bool _workersStarted = false;
@@ -27,18 +29,19 @@ namespace FileServer.Services
             ".m4v", ".3gp", ".ts", ".mts", ".m2ts", ".mpeg", ".mpg"
         };
 
-        // 硬编码 FFmpeg 路径
-        private const string FFmpegPath = @"D:\ffmpeg-release-full\ffmpeg-7.1.1-full_build\bin\ffmpeg.exe";
-        private const string FFprobePath = @"D:\ffmpeg-release-full\ffmpeg-7.1.1-full_build\bin\ffprobe.exe";
-
-        public VideoThumbnailService(IServiceScopeFactory serviceScopeFactory, ILogger<VideoThumbnailService> logger)
+        public VideoThumbnailService(
+            IServiceScopeFactory serviceScopeFactory,
+            ILogger<VideoThumbnailService> logger,
+            IOptions<FileServerConfig> config)
         {
             _serviceScopeFactory = serviceScopeFactory;
             _logger = logger;
+            _config = config.Value;
 
             _processingVideos = new ConcurrentDictionary<string, byte>();
             _generationQueue = new ConcurrentQueue<string>();
             _cancellationTokenSource = new CancellationTokenSource();
+            _maxConcurrentWorkers = _config.MaxConcurrentThumbnailWorkers;
 
             ValidateFFmpegTools();
             _logger.LogInformation("VideoThumbnailService 构造函数完成");
@@ -48,7 +51,9 @@ namespace FileServer.Services
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("启动视频缩略图服务 - 4并发工作模式");
+            _logger.LogInformation("启动视频缩略图服务 - {WorkerCount}并发工作模式", _maxConcurrentWorkers);
+            _logger.LogInformation("FFmpeg路径: {FfmpegPath}", _config.FFmpegPath);
+            _logger.LogInformation("FFprobe路径: {FfprobePath}", _config.FFprobePath);
 
             try
             {
@@ -76,7 +81,7 @@ namespace FileServer.Services
                 // 启动后台扫描
                 _ = Task.Run(async () => await ScanAndPreGenerateThumbnails(), cancellationToken);
 
-                _logger.LogInformation("视频缩略图服务启动完成，启动 {WorkerCount} 个工作线程", MAX_CONCURRENT_WORKERS);
+                _logger.LogInformation("视频缩略图服务启动完成，启动 {WorkerCount} 个工作线程", _maxConcurrentWorkers);
             }
             catch (Exception ex)
             {
@@ -90,15 +95,15 @@ namespace FileServer.Services
         {
             if (_workersStarted) return;
 
-            _workerTasks = new Task[MAX_CONCURRENT_WORKERS];
-            for (int i = 0; i < MAX_CONCURRENT_WORKERS; i++)
+            _workerTasks = new Task[_maxConcurrentWorkers];
+            for (int i = 0; i < _maxConcurrentWorkers; i++)
             {
                 int workerId = i;
                 _workerTasks[i] = Task.Run(async () => await ProcessQueueWorker(workerId), _cancellationTokenSource.Token);
                 _logger.LogDebug("工作线程 {WorkerId} 已创建", workerId);
             }
             _workersStarted = true;
-            _logger.LogInformation("所有 {WorkerCount} 个工作线程已启动", MAX_CONCURRENT_WORKERS);
+            _logger.LogInformation("所有 {WorkerCount} 个工作线程已启动", _maxConcurrentWorkers);
         }
 
         public async Task StopAsync(CancellationToken cancellationToken)
@@ -289,9 +294,9 @@ namespace FileServer.Services
                 var request = new VideoThumbnailRequest
                 {
                     VideoPath = videoPath,
-                    Width = 320,
-                    Height = 180,
-                    OutputFormat = "jpg"
+                    Width = _config.ThumbnailWidth,
+                    Height = _config.ThumbnailHeight,
+                    OutputFormat = _config.ThumbnailFormat
                 };
 
                 var result = await GenerateThumbnailAsync(request);
@@ -356,7 +361,7 @@ namespace FileServer.Services
                     {
                         Success = true,
                         ThumbnailPath = thumbnailPath,
-                        PositionPercentage = 50,
+                        PositionPercentage = _config.ThumbnailPositionPercentage,
                         Message = "缩略图已存在"
                     };
                 }
@@ -368,7 +373,9 @@ namespace FileServer.Services
                 if (duration != null)
                 {
                     var random = new Random();
-                    var positionPercentage = request.PositionPercentage ?? random.Next(30, 71);
+                    var positionPercentage = request.PositionPercentage ??
+                        (request.PositionPercentage.HasValue ? request.PositionPercentage.Value : _config.ThumbnailPositionPercentage);
+
                     thumbnailTime = TimeSpan.FromSeconds(duration.Value.TotalSeconds * positionPercentage / 100.0);
 
                     _logger.LogDebug("视频时长: {Duration}, 缩略图位置: {Position}% ({Time})",
@@ -389,7 +396,7 @@ namespace FileServer.Services
                     {
                         Success = true,
                         ThumbnailPath = thumbnailPath,
-                        PositionPercentage = 50,
+                        PositionPercentage = _config.ThumbnailPositionPercentage,
                         VideoDuration = videoDuration,
                         ThumbnailTime = thumbnailTime,
                         Message = "缩略图生成成功"
@@ -403,7 +410,7 @@ namespace FileServer.Services
                         {
                             Success = true,
                             ThumbnailPath = thumbnailPath,
-                            PositionPercentage = 50,
+                            PositionPercentage = _config.ThumbnailPositionPercentage,
                             VideoDuration = videoDuration,
                             ThumbnailTime = thumbnailTime,
                             Message = "使用占位图"
@@ -427,7 +434,6 @@ namespace FileServer.Services
                 };
             }
         }
-        
 
         public async Task<bool> VideoFileExistsAsync(string videoPath)
         {
@@ -447,9 +453,9 @@ namespace FileServer.Services
         {
             try
             {
-                if (!File.Exists(FFprobePath))
+                if (!File.Exists(_config.FFprobePath))
                 {
-                    _logger.LogWarning("FFprobe工具不存在: {FFprobePath}", FFprobePath);
+                    _logger.LogWarning("FFprobe工具不存在: {FFprobePath}", _config.FFprobePath);
                     return null;
                 }
 
@@ -459,7 +465,7 @@ namespace FileServer.Services
 
                 var processStartInfo = new ProcessStartInfo
                 {
-                    FileName = FFprobePath,
+                    FileName = _config.FFprobePath,
                     Arguments = arguments,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -546,14 +552,18 @@ namespace FileServer.Services
             return _videoExtensions.Contains(extension.ToLowerInvariant());
         }
 
-        public bool ThumbnailExists(string videoPath, int width = 320, int height = 180)
+        public bool ThumbnailExists(string videoPath, int width = -1, int height = -1)
         {
             using var scope = _serviceScopeFactory.CreateScope();
             var fileService = scope.ServiceProvider.GetRequiredService<IFileService>();
+
+            if (width == -1) width = _config.ThumbnailWidth;
+            if (height == -1) height = _config.ThumbnailHeight;
+
             return ThumbnailExists(videoPath, fileService, width, height);
         }
 
-        private bool ThumbnailExists(string videoPath, IFileService fileService, int width = 320, int height = 180)
+        private bool ThumbnailExists(string videoPath, IFileService fileService, int width = -1, int height = -1)
         {
             try
             {
@@ -563,12 +573,15 @@ namespace FileServer.Services
                     return false;
                 }
 
+                if (width == -1) width = _config.ThumbnailWidth;
+                if (height == -1) height = _config.ThumbnailHeight;
+
                 var request = new VideoThumbnailRequest
                 {
                     VideoPath = videoPath,
                     Width = width,
                     Height = height,
-                    OutputFormat = "jpg"
+                    OutputFormat = _config.ThumbnailFormat
                 };
 
                 var thumbnailPath = GetThumbnailFilePath(request, fileService);
@@ -587,17 +600,20 @@ namespace FileServer.Services
             }
         }
 
-        public string GetThumbnailPath(string videoPath, int width = 320, int height = 180)
+        public string GetThumbnailPath(string videoPath, int width = -1, int height = -1)
         {
             using var scope = _serviceScopeFactory.CreateScope();
             var fileService = scope.ServiceProvider.GetRequiredService<IFileService>();
+
+            if (width == -1) width = _config.ThumbnailWidth;
+            if (height == -1) height = _config.ThumbnailHeight;
 
             var request = new VideoThumbnailRequest
             {
                 VideoPath = videoPath,
                 Width = width,
                 Height = height,
-                OutputFormat = "jpg"
+                OutputFormat = _config.ThumbnailFormat
             };
 
             var thumbnailPath = GetThumbnailFilePath(request, fileService);
@@ -616,7 +632,7 @@ namespace FileServer.Services
             var results = new List<VideoThumbnailResponse>();
             var tasks = new List<Task<VideoThumbnailResponse>>();
 
-            var semaphore = new SemaphoreSlim(4);
+            var semaphore = new SemaphoreSlim(_maxConcurrentWorkers);
 
             foreach (var request in requests)
             {
@@ -706,9 +722,9 @@ namespace FileServer.Services
         {
             try
             {
-                if (!File.Exists(FFmpegPath))
+                if (!File.Exists(_config.FFmpegPath))
                 {
-                    _logger.LogError("FFmpeg工具不存在: {FfmpegPath}", FFmpegPath);
+                    _logger.LogError("FFmpeg工具不存在: {FfmpegPath}", _config.FFmpegPath);
                     return false;
                 }
 
@@ -723,11 +739,11 @@ namespace FileServer.Services
 
                 var arguments = $"-ss {timeString} -i \"{physicalVideoPath}\" -vframes 1 -s {width}x{height} -q:v 2 -f image2 -y \"{thumbnailPath}\"";
 
-                _logger.LogDebug("执行FFmpeg命令: {FfmpegPath} {Arguments}", FFmpegPath, arguments);
+                _logger.LogDebug("执行FFmpeg命令: {FfmpegPath} {Arguments}", _config.FFmpegPath, arguments);
 
                 var processStartInfo = new ProcessStartInfo
                 {
-                    FileName = FFmpegPath,
+                    FileName = _config.FFmpegPath,
                     Arguments = arguments,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -857,7 +873,10 @@ namespace FileServer.Services
                 var hash = BitConverter.ToString(md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(uniqueKey)))
                     .Replace("-", "").ToLower();
 
-                var fileName = $"{hash}.{request.OutputFormat.ToLowerInvariant()}";
+                var format = string.IsNullOrEmpty(request.OutputFormat) ?
+                    _config.ThumbnailFormat : request.OutputFormat;
+
+                var fileName = $"{hash}.{format.ToLowerInvariant()}";
 
                 // 确保_thumbnailsRoot不为null
                 if (string.IsNullOrEmpty(_thumbnailsRoot))
@@ -898,11 +917,11 @@ namespace FileServer.Services
             {
                 _logger.LogInformation("验证FFmpeg工具...");
 
-                if (File.Exists(FFmpegPath))
+                if (File.Exists(_config.FFmpegPath))
                 {
                     var processStartInfo = new ProcessStartInfo
                     {
-                        FileName = FFmpegPath,
+                        FileName = _config.FFmpegPath,
                         Arguments = "-version",
                         RedirectStandardOutput = true,
                         UseShellExecute = false,
@@ -915,20 +934,20 @@ namespace FileServer.Services
                         process.WaitForExit(5000);
                         if (process.ExitCode == 0)
                         {
-                            _logger.LogInformation("FFmpeg工具验证成功: {FfmpegPath}", FFmpegPath);
+                            _logger.LogInformation("FFmpeg工具验证成功: {FfmpegPath}", _config.FFmpegPath);
                         }
                     }
                 }
                 else
                 {
-                    _logger.LogWarning("FFmpeg工具不存在: {FfmpegPath}", FFmpegPath);
+                    _logger.LogWarning("FFmpeg工具不存在: {FfmpegPath}", _config.FFmpegPath);
                 }
 
-                if (File.Exists(FFprobePath))
+                if (File.Exists(_config.FFprobePath))
                 {
                     var processStartInfo = new ProcessStartInfo
                     {
-                        FileName = FFprobePath,
+                        FileName = _config.FFprobePath,
                         Arguments = "-version",
                         RedirectStandardOutput = true,
                         UseShellExecute = false,
@@ -941,13 +960,13 @@ namespace FileServer.Services
                         process.WaitForExit(5000);
                         if (process.ExitCode == 0)
                         {
-                            _logger.LogInformation("FFprobe工具验证成功: {FfprobePath}", FFprobePath);
+                            _logger.LogInformation("FFprobe工具验证成功: {FfprobePath}", _config.FFprobePath);
                         }
                     }
                 }
                 else
                 {
-                    _logger.LogWarning("FFprobe工具不存在: {FfprobePath}", FFprobePath);
+                    _logger.LogWarning("FFprobe工具不存在: {FfprobePath}", _config.FFprobePath);
                 }
             }
             catch (Exception ex)

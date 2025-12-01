@@ -1,4 +1,5 @@
 ﻿using FileServer.Models;
+using System.Text;
 
 namespace FileServer.Services
 {
@@ -6,7 +7,7 @@ namespace FileServer.Services
     {
         Task<FileListResponse> GetFileListAsync(string relativePath);
         Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath);
-        Task<FileInfoModel> GetFileInfoAsync(string filePath); // 新增方法
+        Task<FileInfoModel> GetFileInfoAsync(string filePath);
         Task<UploadResponse> UploadFilesAsync(string targetPath, IFormFileCollection files);
         Task<bool> FileExistsAsync(string filePath);
         Task<bool> DirectoryExistsAsync(string directoryPath);
@@ -55,7 +56,7 @@ namespace FileServer.Services
                 {
                     Name = fileInfo.Name,
                     Path = filePath,
-                    Size = fileInfo.Length, // 这里使用 FileInfo.Length 赋值给 FileInfoModel.Size
+                    Size = fileInfo.Length,
                     SizeFormatted = FormatFileSize(fileInfo.Length),
                     Extension = extension,
                     LastModified = fileInfo.LastWriteTime,
@@ -66,7 +67,6 @@ namespace FileServer.Services
                 };
             });
         }
-
 
         public async Task<FileListResponse> GetFileListAsync(string relativePath)
         {
@@ -90,7 +90,6 @@ namespace FileServer.Services
 
             try
             {
-                // 处理目录
                 var directories = Directory.GetDirectories(physicalPath);
                 foreach (var dir in directories)
                 {
@@ -109,7 +108,6 @@ namespace FileServer.Services
                     }
                 }
 
-                // 处理文件
                 var files = Directory.GetFiles(physicalPath);
                 foreach (var file in files)
                 {
@@ -131,10 +129,9 @@ namespace FileServer.Services
                             IsAudio = IsAudioFile(extension),
                             MimeType = GetMimeType(extension),
                             Encoding = IsTextFile(extension) ? "utf-8" : "",
-                            HasThumbnail = false // 默认没有缩略图
+                            HasThumbnail = false
                         };
 
-                        // 如果是图片文件，检查是否有缩略图
                         if (IsImageFile(extension))
                         {
                             fileModel.HasThumbnail = await _thumbnailService.ThumbnailExistsAsync(relativeFilePath);
@@ -200,15 +197,33 @@ namespace FileServer.Services
             var uploadedFiles = new List<string>();
             long totalSize = 0;
 
+            _logger.LogInformation("开始上传文件，目标路径: {TargetPath}", targetPath);
+            _logger.LogInformation("接收到的文件数量: {FileCount}", files.Count);
+
             foreach (var file in files)
             {
                 if (file.Length == 0) continue;
 
+                // 记录上传文件的详细信息
+                _logger.LogInformation("处理上传文件 - 原始文件名: {OriginalFileName}, " +
+                                       "ContentType: {ContentType}, " +
+                                       "大小: {Size}, " +
+                                       "字段名: {FieldName}",
+                    file.FileName, file.ContentType, file.Length, file.Name);
+
+                var originalFileName = file.FileName;
                 var fileName = MakeValidFileName(file.FileName);
                 var filePath = Path.Combine(uploadPath, fileName);
                 var relativeFilePath = string.IsNullOrEmpty(targetPath)
                     ? fileName
                     : Path.Combine(targetPath, fileName).Replace("\\", "/");
+
+                // 记录文件名变化
+                if (originalFileName != fileName)
+                {
+                    _logger.LogInformation("文件名处理: '{Original}' -> '{New}'",
+                        originalFileName, fileName);
+                }
 
                 try
                 {
@@ -217,12 +232,25 @@ namespace FileServer.Services
                         await file.CopyToAsync(stream);
                     }
 
+                    // 验证文件内容
                     var fileInfo = new FileInfo(filePath);
+                    if (!fileInfo.Exists || fileInfo.Length == 0)
+                    {
+                        _logger.LogError("文件保存失败或大小为0: {FilePath}", filePath);
+                        continue;
+                    }
+
+                    // 验证文件格式
+                    var extension = Path.GetExtension(fileName).ToLowerInvariant();
+                    await ValidateFileFormat(filePath, extension, originalFileName);
+
                     totalSize += fileInfo.Length;
                     uploadedFiles.Add(fileName);
 
+                    _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
+                        fileName, filePath, FormatFileSize(fileInfo.Length));
+
                     // 如果是图片文件，生成缩略图
-                    var extension = Path.GetExtension(fileName).ToLowerInvariant();
                     if (IsImageFile(extension))
                     {
                         _ = Task.Run(async () =>
@@ -230,6 +258,7 @@ namespace FileServer.Services
                             try
                             {
                                 await _thumbnailService.GenerateThumbnailAsync(relativeFilePath);
+                                _logger.LogDebug("缩略图生成成功: {FileName}", fileName);
                             }
                             catch (Exception ex)
                             {
@@ -237,9 +266,6 @@ namespace FileServer.Services
                             }
                         });
                     }
-
-                    _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
-                        fileName, filePath, FormatFileSize(fileInfo.Length));
                 }
                 catch (Exception ex)
                 {
@@ -262,7 +288,61 @@ namespace FileServer.Services
                 TotalSizeFormatted = FormatFileSize(totalSize)
             };
         }
-        // 添加删除文件方法（支持删除缩略图）
+
+        private async Task ValidateFileFormat(string filePath, string extension, string originalFileName)
+        {
+            try
+            {
+                if (extension == ".gif")
+                {
+                    await ValidateGifFile(filePath, originalFileName);
+                }
+                else if (IsImageFile(extension))
+                {
+                    await ValidateImageFile(filePath, originalFileName, extension);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "文件格式验证失败: {FileName}", originalFileName);
+            }
+        }
+
+        private async Task ValidateGifFile(string filePath, string originalFileName)
+        {
+            using var fileStream = File.OpenRead(filePath);
+            var buffer = new byte[6];
+            await fileStream.ReadAsync(buffer, 0, 6);
+
+            var header = Encoding.ASCII.GetString(buffer);
+            if (header == "GIF87a" || header == "GIF89a")
+            {
+                _logger.LogInformation("GIF 文件验证成功: {FileName}", originalFileName);
+            }
+            else
+            {
+                _logger.LogWarning("GIF 文件可能已损坏或格式不正确: {FileName} (头部: {Header})",
+                    originalFileName, header);
+            }
+        }
+
+        private async Task ValidateImageFile(string filePath, string originalFileName, string extension)
+        {
+            try
+            {
+                using var fileStream = File.OpenRead(filePath);
+                var buffer = new byte[8];
+                await fileStream.ReadAsync(buffer, 0, 8);
+
+                var hex = BitConverter.ToString(buffer).Replace("-", "");
+                _logger.LogDebug("图像文件 {FileName} 头部: {Header}", originalFileName, hex);
+            }
+            catch
+            {
+                // 忽略验证错误
+            }
+        }
+
         public async Task<bool> DeleteFileAsync(string filePath)
         {
             try
@@ -275,7 +355,6 @@ namespace FileServer.Services
 
                 File.Delete(physicalPath);
 
-                // 如果是图片文件，删除对应的缩略图
                 var extension = Path.GetExtension(filePath).ToLowerInvariant();
                 if (IsImageFile(extension))
                 {
@@ -292,7 +371,6 @@ namespace FileServer.Services
             }
         }
 
-        // 添加缩略图获取方法
         public async Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath)
         {
             var extension = Path.GetExtension(filePath).ToLowerInvariant();
@@ -305,7 +383,6 @@ namespace FileServer.Services
             return (stream, "image/jpeg", $"{Path.GetFileNameWithoutExtension(filePath)}_thumb.jpg");
         }
 
-        // 添加图片文件判断方法
         private bool IsImageFile(string extension)
         {
             var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
@@ -434,8 +511,85 @@ namespace FileServer.Services
 
         private string MakeValidFileName(string name)
         {
-            var invalidChars = Path.GetInvalidFileNameChars();
-            return new string(name.Where(ch => !invalidChars.Contains(ch)).ToArray());
+            try
+            {
+                _logger.LogInformation("开始处理文件名: '{OriginalName}'", name);
+
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    var guidName = $"upload_{Guid.NewGuid():N}{GetDefaultExtension(name)}";
+                    _logger.LogWarning("文件名为空或空白，生成新文件名: '{GuidName}'", guidName);
+                    return guidName;
+                }
+
+                // 分离文件名和扩展名
+                var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(name);
+                var extension = Path.GetExtension(name);
+
+                _logger.LogDebug("分离文件名和扩展名 - 文件名部分: '{FileNamePart}', 扩展名: '{Extension}'",
+                    fileNameWithoutExtension, extension);
+
+                if (string.IsNullOrEmpty(fileNameWithoutExtension))
+                {
+                    fileNameWithoutExtension = $"upload_{Guid.NewGuid():N}";
+                    _logger.LogWarning("文件名部分为空，使用GUID替换: '{FileNameWithoutExtension}'",
+                        fileNameWithoutExtension);
+                }
+
+                // 记录原始文件名中的字符信息
+                _logger.LogDebug("原始文件名字符分析 - 长度: {Length}, 包含中文: {HasChinese}, 包含特殊字符: {HasSpecialChars}",
+                    fileNameWithoutExtension.Length,
+                    fileNameWithoutExtension.Any(c => c >= 0x4E00 && c <= 0x9FFF),
+                    fileNameWithoutExtension.Any(c => Path.GetInvalidFileNameChars().Contains(c)));
+
+                // 只移除真正的非法字符，保留Unicode字符（中文等）
+                var invalidChars = Path.GetInvalidFileNameChars();
+                var validFileName = new string(fileNameWithoutExtension
+                    .Where(ch => !invalidChars.Contains(ch))
+                    .ToArray());
+
+                _logger.LogDebug("移除非法字符后 - 有效文件名部分: '{ValidFileName}', 原始长度: {OriginalLength}, 新长度: {NewLength}",
+                    validFileName, fileNameWithoutExtension.Length, validFileName.Length);
+
+                // 如果移除后文件名为空，使用GUID
+                if (string.IsNullOrWhiteSpace(validFileName))
+                {
+                    validFileName = $"upload_{Guid.NewGuid():N}";
+                    _logger.LogWarning("移除非法字符后文件名为空，使用GUID替换: '{ValidFileName}'",
+                        validFileName);
+                }
+
+                // 确保扩展名是有效的
+                var validExtension = string.IsNullOrEmpty(extension)
+                    ? GetDefaultExtension(name)
+                    : extension;
+
+                var finalFileName = validFileName + validExtension;
+
+                _logger.LogInformation("文件名处理完成 - 原始: '{OriginalName}' -> 最终: '{FinalName}'",
+                    name, finalFileName);
+
+                return finalFileName;
+            }
+            catch (Exception ex)
+            {
+                // 如果出错，返回一个安全的文件名
+                var guidName = $"upload_{Guid.NewGuid():N}{GetDefaultExtension(name)}";
+                _logger.LogError(ex, "处理文件名时发生异常，原始文件名: '{OriginalName}'，使用默认文件名: '{GuidName}'",
+                    name, guidName);
+                return guidName;
+            }
+        }
+
+        private string GetDefaultExtension(string originalName)
+        {
+            var originalExtension = Path.GetExtension(originalName);
+            if (!string.IsNullOrEmpty(originalExtension))
+            {
+                return originalExtension;
+            }
+
+            return ".dat";
         }
     }
 }

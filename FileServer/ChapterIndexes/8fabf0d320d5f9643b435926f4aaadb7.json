@@ -1,0 +1,33 @@
+{
+  "FilePath": "data/\u6587\u672C/\u540D\u8457/\u795E\u62F3.txt",
+  "FileSize": 107165,
+  "FileLastModified": "2025-11-25T17:54:39.9425196+08:00",
+  "IndexTime": "2025-12-01T17:29:24.1663422+08:00",
+  "TotalChapters": 4,
+  "Chapters": [
+    {
+      "Title": "\u7B2C\u4E00\u5E55",
+      "Page": 1,
+      "LineNumber": 25,
+      "Preview": "\u65F6\u95F4\u3000\u4E00\u4E5D\u96F6\u96F6\u5E74\u521D\uFF0C\u4E0B\u5348\u3002 \u5730\u70B9\u3000\u4EAC\u897F\u67D0\u53BF\u53BF\u57CE\u5916\uFF0C\u519C\u6C11\u9AD8\u5BB6\u3002"
+    },
+    {
+      "Title": "\u7B2C\u4E8C\u5E55",
+      "Page": 1,
+      "LineNumber": 270,
+      "Preview": "\u65F6\u95F4\u3000\u524D\u5E55\u540E\u534A\u4E2A\u591A\u6708\uFF0C\u665A\u3002"
+    },
+    {
+      "Title": "\u7B2C\u4E09\u5E55",
+      "Page": 1,
+      "LineNumber": 482,
+      "Preview": "\u65F6\u95F4\u3000\u524D\u5E55\u540E\u56DB\u65E5\uFF0C\u9ECE\u660E\u3002"
+    },
+    {
+      "Title": "\u7B2C\u56DB\u5E55",
+      "Page": 1,
+      "LineNumber": 928,
+      "Preview": "\u5730\u70B9\u3000\u5317\u4EAC\u660E\u5B85\u7684\u82B1\u56ED\u2014\u2014\u5185\u8BBE\u795E\u575B\u3002"
+    }
+  ]
+}

@@ -10,5 +10,16 @@
         public bool EnableQuic { get; set; } = true;
         public string CertificatePath { get; set; } = "";
         public string CertificatePassword { get; set; } = "";
+
+        // 添加FFmpeg相关配置
+        public string FFmpegPath { get; set; } = @"D:\ffmpeg-release-full\ffmpeg-7.1.1-full_build\bin\ffmpeg.exe";
+        public string FFprobePath { get; set; } = @"D:\ffmpeg-release-full\ffmpeg-7.1.1-full_build\bin\ffprobe.exe";
+
+        // 缩略图配置
+        public int ThumbnailWidth { get; set; } = 320;
+        public int ThumbnailHeight { get; set; } = 180;
+        public string ThumbnailFormat { get; set; } = "jpg";
+        public int MaxConcurrentThumbnailWorkers { get; set; } = 4;
+        public int ThumbnailPositionPercentage { get; set; } = 50;
     }
 }
