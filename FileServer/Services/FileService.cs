@@ -24,12 +24,17 @@ namespace FileServer.Services
         private readonly IThumbnailService _thumbnailService;
         private readonly string _rootPath;
         private readonly ILogger<FileService> _logger;
+        private readonly IFileConflictService _conflictService;
 
-        public FileService(IConfiguration configuration, ILogger<FileService> logger, IThumbnailService thumbnailService)
+        public FileService(IConfiguration configuration,
+                   ILogger<FileService> logger,
+                   ThumbnailService thumbnailService,
+                   IFileConflictService conflictService)  
         {
             _rootPath = configuration["FileServer:RootPath"] ?? @"D:\FileServer";
             _logger = logger;
             _thumbnailService = thumbnailService;
+            _conflictService = conflictService; 
 
             if (!Directory.Exists(_rootPath))
             {
@@ -194,15 +199,23 @@ namespace FileServer.Services
                 _logger.LogInformation("创建上传目录: {UploadPath}", uploadPath);
             }
 
-            var uploadedFiles = new List<string>();
+            var uploadedFiles = new List<UploadedFileInfo>();
+            var resolvedConflicts = new List<ConflictResolutionInfo>();
             long totalSize = 0;
+            int renameCount = 0;
+            int failedCount = 0;
 
             _logger.LogInformation("开始上传文件，目标路径: {TargetPath}", targetPath);
             _logger.LogInformation("接收到的文件数量: {FileCount}", files.Count);
 
             foreach (var file in files)
             {
-                if (file.Length == 0) continue;
+                if (file.Length == 0)
+                {
+                    _logger.LogWarning("跳过空文件: {FileName}", file.FileName);
+                    failedCount++;
+                    continue;
+                }
 
                 // 记录上传文件的详细信息
                 _logger.LogInformation("处理上传文件 - 原始文件名: {OriginalFileName}, " +
@@ -213,6 +226,11 @@ namespace FileServer.Services
 
                 var originalFileName = file.FileName;
                 var fileName = MakeValidFileName(file.FileName);
+
+                // 使用冲突服务获取唯一文件名
+                var originalFileNameForConflict = fileName; // 保存清理后的文件名
+                fileName = await _conflictService.GenerateUniqueFileNameAsync(uploadPath, fileName);
+
                 var filePath = Path.Combine(uploadPath, fileName);
                 var relativeFilePath = string.IsNullOrEmpty(targetPath)
                     ? fileName
@@ -221,12 +239,30 @@ namespace FileServer.Services
                 // 记录文件名变化
                 if (originalFileName != fileName)
                 {
-                    _logger.LogInformation("文件名处理: '{Original}' -> '{New}'",
-                        originalFileName, fileName);
+                    var reason = originalFileName != originalFileNameForConflict
+                        ? "非法字符处理"
+                        : "重名冲突";
+
+                    _logger.LogInformation("文件名处理: '{Original}' -> '{New}' (原因: {Reason})",
+                        originalFileName, fileName, reason);
+
+                    if (reason == "重名冲突")
+                    {
+                        renameCount++;
+                        resolvedConflicts.Add(new ConflictResolutionInfo
+                        {
+                            OriginalName = originalFileName,
+                            FinalName = fileName,
+                            Reason = reason,
+                            Timestamp = DateTime.UtcNow,
+                            ResolutionStrategy = "AddCounter"
+                        });
+                    }
                 }
 
                 try
                 {
+                    // 保存文件
                     using (var stream = new FileStream(filePath, FileMode.Create))
                     {
                         await file.CopyToAsync(stream);
@@ -237,6 +273,7 @@ namespace FileServer.Services
                     if (!fileInfo.Exists || fileInfo.Length == 0)
                     {
                         _logger.LogError("文件保存失败或大小为0: {FilePath}", filePath);
+                        failedCount++;
                         continue;
                     }
 
@@ -245,7 +282,19 @@ namespace FileServer.Services
                     await ValidateFileFormat(filePath, extension, originalFileName);
 
                     totalSize += fileInfo.Length;
-                    uploadedFiles.Add(fileName);
+
+                    // 添加上传文件信息
+                    uploadedFiles.Add(new UploadedFileInfo
+                    {
+                        OriginalName = originalFileName,
+                        SavedName = fileName,
+                        Path = relativeFilePath,
+                        Size = fileInfo.Length,
+                        WasRenamed = originalFileName != fileName,
+                        RenameReason = originalFileName != fileName ?
+                            (originalFileName != originalFileNameForConflict ?
+                                "非法字符处理" : "重名冲突") : ""
+                    });
 
                     _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
                         fileName, filePath, FormatFileSize(fileInfo.Length));
@@ -270,23 +319,59 @@ namespace FileServer.Services
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "文件保存失败: {FileName}", fileName);
+                    failedCount++;
+
+                    // 记录失败信息
+                    uploadedFiles.Add(new UploadedFileInfo
+                    {
+                        OriginalName = originalFileName,
+                        SavedName = fileName,
+                        Path = relativeFilePath,
+                        Size = file.Length,
+                        WasRenamed = false,
+                        RenameReason = $"上传失败: {ex.Message}"
+                    });
                 }
             }
 
             if (uploadedFiles.Count > 0)
             {
-                _logger.LogInformation("上传完成: {FileCount} 个文件，总大小: {TotalSize}",
-                    uploadedFiles.Count, FormatFileSize(totalSize));
+                _logger.LogInformation("上传完成: {FileCount} 个文件成功，{FailedCount} 个失败，" +
+                                      "总大小: {TotalSize}，重命名: {RenameCount}",
+                    uploadedFiles.Count - failedCount, failedCount,
+                    FormatFileSize(totalSize), renameCount);
+            }
+            else
+            {
+                _logger.LogWarning("没有文件成功上传");
             }
 
-            return new UploadResponse
+            // 构建响应
+            var response = new UploadResponse
             {
-                Success = uploadedFiles.Count > 0,
-                Message = uploadedFiles.Count > 0 ? $"成功上传 {uploadedFiles.Count} 个文件" : "没有文件被上传",
-                Files = uploadedFiles,
+                Success = uploadedFiles.Count - failedCount > 0,
+                Message = uploadedFiles.Count - failedCount > 0
+                    ? $"成功上传 {uploadedFiles.Count - failedCount} 个文件"
+                    : "上传失败",
                 TotalSize = totalSize,
-                TotalSizeFormatted = FormatFileSize(totalSize)
+                UploadedFiles = uploadedFiles,
+                ResolvedConflicts = resolvedConflicts,
+                TotalFiles = files.Count,
+                SuccessfulUploads = uploadedFiles.Count - failedCount,
+                ConflictsResolved = renameCount,
+                FailedUploads = failedCount
             };
+
+            // 为了向后兼容，保持原有的 Files 字段
+            response.Files = uploadedFiles
+                .Where(f => string.IsNullOrEmpty(f.RenameReason) || !f.RenameReason.StartsWith("上传失败"))
+                .Select(f => f.SavedName)
+                .ToList();
+
+            // 计算格式化的大小
+            response.CalculateFormattedSize();
+
+            return response;
         }
 
         private async Task ValidateFileFormat(string filePath, string extension, string originalFileName)

@@ -21,5 +21,23 @@
         public string ThumbnailFormat { get; set; } = "jpg";
         public int MaxConcurrentThumbnailWorkers { get; set; } = 4;
         public int ThumbnailPositionPercentage { get; set; } = 50;
+
+        // ====== 新增：冲突解决配置 ======
+        public ConflictResolutionConfig ConflictResolution { get; set; } = new ConflictResolutionConfig();
+    }
+
+    // 新增：冲突解决配置类
+    public class ConflictResolutionConfig
+    {
+        public string Strategy { get; set; } = "AddCounter";
+        public string CounterFormat { get; set; } = " ({0})";
+        public int MaxAttempts { get; set; } = 1000;
+        public bool EnableLogging { get; set; } = true;
+        public bool KeepOriginalExtension { get; set; } = true;
+        public bool SkipEmptyFiles { get; set; } = true;
+        public int MaxFilenameLength { get; set; } = 255;
+        public bool GenerateBackup { get; set; } = false; // 是否生成备份
+        public string BackupDirectory { get; set; } = ".backups"; // 备份目录
+        public int KeepBackupDays { get; set; } = 30; // 保留备份天数
     }
 }

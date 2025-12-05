@@ -7,31 +7,35 @@ using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 配置服务
+// 1. 配置绑定 - 使用 FileServerConfig 节点
 builder.Services.Configure<FileServerConfig>(
-    builder.Configuration.GetSection("FileServer"));
+    builder.Configuration.GetSection("FileServerConfig")); // 注意这里是 FileServerConfig
 
-// 修复服务注册 - 确保只注册一次
+// 2. 注册 ThumbnailService 具体类（FileService 需要）
+builder.Services.AddScoped<ThumbnailService>(); // 关键：注册具体类
+
+// 3. 注册 ThumbnailService 接口指向具体类
+builder.Services.AddScoped<IThumbnailService>(provider =>
+    provider.GetRequiredService<ThumbnailService>());
+
+// 4. 注册其他服务
 builder.Services.AddScoped<IServerStatusService, ServerStatusService>();
-builder.Services.AddScoped<IThumbnailService, ThumbnailService>();
 builder.Services.AddScoped<IFileService, FileService>();
 builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
 builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
+builder.Services.AddScoped<IFileConflictService, FileConflictService>();
 
-// 关键修复：正确注册 VideoThumbnailService
-// 方法1：作为 HostedService 注册
+// 5. VideoThumbnailService
 builder.Services.AddSingleton<VideoThumbnailService>();
 builder.Services.AddSingleton<IHostedService>(provider =>
     provider.GetRequiredService<VideoThumbnailService>());
 builder.Services.AddSingleton<IVideoThumbnailService>(provider =>
     provider.GetRequiredService<VideoThumbnailService>());
 
-// 或者方法2：分开注册（推荐）
-// builder.Services.AddSingleton<IVideoThumbnailService, VideoThumbnailService>();
-// builder.Services.AddSingleton<IHostedService, VideoThumbnailService>();
-
-// 添加控制器
+// 6. 添加控制器
 builder.Services.AddControllers();
+
+
 // 创建并信任开发者证书
 var certificate = CreateAndTrustDeveloperCertificate();
 if (certificate != null)
