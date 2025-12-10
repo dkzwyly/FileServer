@@ -18,6 +18,8 @@ namespace FileServer.Controllers
         private readonly IMemoryMappedFileService _memoryMappedService;
         private readonly IChapterIndexService _chapterIndexService;
         private readonly IVideoThumbnailService _videoThumbnailService;
+        private readonly IAudioMetadataService _audioMetadataService;
+        private readonly IPhotoMetadataService _photoMetadataService;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
@@ -25,7 +27,9 @@ namespace FileServer.Controllers
                                   IConfiguration configuration,
                                   IMemoryMappedFileService memoryMappedService,
                                   IChapterIndexService chapterIndexService,
-                                  IVideoThumbnailService videoThumbnailService) 
+                                  IVideoThumbnailService videoThumbnailService,
+                                  IAudioMetadataService audioMetadataService,
+                                  IPhotoMetadataService photoMetadataService)
         {
             _fileService = fileService;
             _statusService = statusService;
@@ -34,6 +38,8 @@ namespace FileServer.Controllers
             _memoryMappedService = memoryMappedService;
             _chapterIndexService = chapterIndexService;
             _videoThumbnailService = videoThumbnailService;
+            _audioMetadataService = audioMetadataService;
+            _photoMetadataService = photoMetadataService;
         }
 
         [HttpGet("status")]
@@ -77,12 +83,73 @@ namespace FileServer.Controllers
         }
 
         [HttpGet("list/{*path}")]
-        public async Task<IActionResult> GetFileList(string path = "")
+        public async Task<IActionResult> GetFileList(string path = "", [FromQuery] string sortBy = "name", [FromQuery] string sortOrder = "asc")
         {
             try
             {
                 _statusService.IncrementRequests();
                 var result = await _fileService.GetFileListAsync(path);
+
+                // 按拍摄时间排序（仅对图片文件有效）
+                if (sortBy.Equals("dateTaken", StringComparison.OrdinalIgnoreCase))
+                {
+                    var imageFiles = result.Files.Where(f => IsImageFile(Path.GetExtension(f.Name))).ToList();
+                    if (imageFiles.Any())
+                    {
+                        var paths = imageFiles.Select(f => f.Path);
+                        var metadataDict = await _photoMetadataService.GetBatchMetadataAsync(paths);
+
+                        var filesWithMetadata = result.Files.Select(f =>
+                        {
+                            var item = new FileListItemWithMetadata
+                            {
+                                Name = f.Name,
+                                Path = f.Path,
+                                Size = f.Size,
+                                SizeFormatted = f.SizeFormatted,
+                                LastModified = f.LastModified,
+                            };
+                            if (metadataDict.TryGetValue(f.Path, out var meta))
+                                item.Metadata = meta;
+                            return item;
+                        }).ToList();
+
+                        var sortedFiles = sortOrder.ToLower() == "asc"
+                            ? filesWithMetadata.OrderBy(f => f.Metadata?.DateTaken ?? DateTime.MaxValue).ToList()
+                            : filesWithMetadata.OrderByDescending(f => f.Metadata?.DateTaken ?? DateTime.MinValue).ToList();
+
+                        var response = new
+                        {
+                            result.CurrentPath,
+                            result.ParentPath,
+                            Directories = result.Directories,
+                            Files = sortedFiles,
+                            MetadataIncluded = true
+                        };
+                        return Ok(response);
+                    }
+                }
+
+                // 其他排序方式（名称、大小、修改时间）
+                switch (sortBy.ToLower())
+                {
+                    case "size":
+                        result.Files = sortOrder.ToLower() == "asc"
+                            ? result.Files.OrderBy(f => f.Size).ToList()
+                            : result.Files.OrderByDescending(f => f.Size).ToList();
+                        break;
+                    case "modified":
+                        result.Files = sortOrder.ToLower() == "asc"
+                            ? result.Files.OrderBy(f => f.LastModified).ToList()
+                            : result.Files.OrderByDescending(f => f.LastModified).ToList();
+                        break;
+                    default:
+                        result.Files = sortOrder.ToLower() == "asc"
+                            ? result.Files.OrderBy(f => f.Name).ToList()
+                            : result.Files.OrderByDescending(f => f.Name).ToList();
+                        break;
+                }
+
                 return Ok(result);
             }
             catch (DirectoryNotFoundException ex)
@@ -93,6 +160,97 @@ namespace FileServer.Controllers
             {
                 _logger.LogError(ex, "获取文件列表失败: {Path}", path);
                 return StatusCode(500, new { error = "服务器内部错误", message = ex.Message });
+            }
+        }
+        // 搜索照片（支持按日期、GPS、分页、排序）
+        [HttpGet("photo-metadata/search")]
+        public async Task<IActionResult> SearchPhotos(
+            [FromQuery] string? directory = null,
+            [FromQuery] string? sortBy = "dateTaken",
+            [FromQuery] bool sortAscending = true,
+            [FromQuery] DateTime? startDate = null,
+            [FromQuery] DateTime? endDate = null,
+            [FromQuery] double? minLat = null,
+            [FromQuery] double? maxLat = null,
+            [FromQuery] double? minLng = null,
+            [FromQuery] double? maxLng = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 100)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                var options = new PhotoSearchOptions
+                {
+                    DirectoryPath = string.IsNullOrEmpty(directory) ? null : WebUtility.UrlDecode(directory),
+                    SortBy = sortBy,
+                    SortAscending = sortAscending,
+                    StartDate = startDate,
+                    EndDate = endDate,
+                    MinLatitude = minLat,
+                    MaxLatitude = maxLat,
+                    MinLongitude = minLng,
+                    MaxLongitude = maxLng,
+                    Skip = (page - 1) * pageSize,
+                    Take = pageSize
+                };
+
+                var (items, totalCount) = await _photoMetadataService.SearchPhotosAsync(options);
+
+                return Ok(new
+                {
+                    page,
+                    pageSize,
+                    totalCount,
+                    totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
+                    items
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "搜索照片失败");
+                return StatusCode(500, new { error = "搜索失败", message = ex.Message });
+            }
+        }
+
+        // 强制刷新单张图片的元数据
+        [HttpPost("photo-metadata/refresh/{*path}")]
+        public async Task<IActionResult> RefreshPhotoMetadata(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+                await _photoMetadataService.RefreshMetadataAsync(path);
+                return Ok(new { success = true, message = "元数据已刷新" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "刷新元数据失败: {Path}", path);
+                return StatusCode(500, new { error = "刷新失败", message = ex.Message });
+            }
+        }
+
+        // 全量重建所有图片的元数据索引（后台异步任务）
+        [HttpPost("photo-metadata/reindex")]
+        public IActionResult ReindexAllPhotos()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                // 后台执行，不阻塞请求
+                _ = Task.Run(async () =>
+                {
+                    var progress = new Progress<string>(msg => _logger.LogInformation(msg));
+                    await _photoMetadataService.ScanAndIndexAllPhotosAsync(progress);
+                });
+                return Accepted(new { message = "全量索引已启动，请查看日志" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "启动全量索引失败");
+                return StatusCode(500, new { error = "启动失败", message = ex.Message });
             }
         }
 
@@ -1214,6 +1372,8 @@ namespace FileServer.Controllers
             }
         }
         #region 歌词相关端点
+        
+
 
         [HttpPost("lyrics/mapping")]
         public async Task<IActionResult> SaveLyricsMapping([FromBody] LyricsMappingRequest request)
@@ -1318,18 +1478,37 @@ namespace FileServer.Controllers
                     return await GetLyricsContent(mappedLyricsPath);
                 }
 
-                // 2. 如果没有映射，尝试在同目录下查找同名的.lrc文件
+                // 2. 如果没有映射，尝试智能匹配
                 var directory = Path.GetDirectoryName(songPath);
-                var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(songPath);
-                var possibleLyricsPath = Path.Combine(directory, fileNameWithoutExtension + ".lrc");
+                var fileName = Path.GetFileNameWithoutExtension(songPath);
 
+                // 智能匹配查找最佳匹配（无论置信度如何，只要有匹配就返回）
+                var bestLyricsMatch = await FindBestLyricsMatch(songPath, fileName, directory);
+
+                if (bestLyricsMatch != null && bestLyricsMatch.LyricsFile != null)
+                {
+                    // 找到匹配，自动保存映射
+                    await SaveLyricsMappingToFile(new LyricsMappingRequest
+                    {
+                        SongPath = songPath,
+                        LyricsPath = bestLyricsMatch.LyricsFile.Path
+                    });
+
+                    _logger.LogInformation("智能匹配成功并建立映射: {SongPath} -> {LyricsPath}, 分数: {Score}",
+                        songPath, bestLyricsMatch.LyricsFile.Path, bestLyricsMatch.MatchScore);
+
+                    return await GetLyricsContent(bestLyricsMatch.LyricsFile.Path);
+                }
+
+                // 3. 如果智能匹配失败（没有找到任何匹配），尝试在同目录下查找同名的.lrc文件
+                var possibleLyricsPath = Path.Combine(directory, fileName + ".lrc");
                 if (await _fileService.FileExistsAsync(possibleLyricsPath))
                 {
                     _logger.LogInformation("找到同名歌词文件: {LyricsPath}", possibleLyricsPath);
                     return await GetLyricsContent(possibleLyricsPath);
                 }
 
-                // 3. 查找同目录下其他歌词文件
+                // 4. 查找同目录下其他歌词文件
                 var lyricsFiles = await FindLyricsFilesInDirectory(directory);
                 if (lyricsFiles.Any())
                 {
@@ -1351,6 +1530,263 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取歌词失败", message = ex.Message });
             }
         }
+
+
+        #region 智能匹配方法
+
+        /// <summary>
+        /// 在同级目录中查找最佳歌词匹配
+        /// </summary>
+        /// <summary>
+        /// 在同级目录中查找最佳歌词匹配
+        /// </summary>
+        private async Task<BestLyricsMatch> FindBestLyricsMatch(string songPath, string songFileName, string directory)
+        {
+            try
+            {
+                // 获取同级目录中的所有歌词文件
+                var lyricsFiles = await FindLyricsFilesInDirectory(directory);
+
+                if (!lyricsFiles.Any())
+                {
+                    return null;
+                }
+
+                // 从歌曲文件名提取信息
+                var songInfo = ExtractSongInfoFromFileName(songFileName);
+                _logger.LogDebug("提取歌曲信息: {FileName} -> 歌名: {SongName}, 歌手: {Artist}",
+                    songFileName, songInfo.SongName, songInfo.Artist);
+
+                BestLyricsMatch bestMatch = null;
+                double bestScore = 0;
+
+                // 对每个歌词文件计算匹配分数
+                foreach (var lyricsFile in lyricsFiles)
+                {
+                    var matchResult = CalculateMatchResult(songInfo, lyricsFile);
+
+                    if (matchResult != null && (bestMatch == null || matchResult.MatchScore > bestScore))
+                    {
+                        bestScore = matchResult.MatchScore;
+                        bestMatch = new BestLyricsMatch
+                        {
+                            LyricsFile = lyricsFile,
+                            MatchScore = matchResult.MatchScore,
+                            MatchedChars = matchResult.MatchedChars,
+                            MatchedMultiChars = matchResult.MatchedMultiChars,
+                            HasLyricsKeyword = matchResult.HasLyricsKeyword
+                        };
+
+                        _logger.LogDebug("更新最佳匹配: {LyricsFile} -> 分数: {Score}",
+                            lyricsFile.Name, matchResult.MatchScore);
+                    }
+                }
+
+                // 只要有匹配就返回（无论分数高低）
+                if (bestMatch != null)
+                {
+                    _logger.LogInformation("找到最佳歌词匹配: {LyricsPath}, 分数: {Score}",
+                        bestMatch.LyricsFile.Path, bestMatch.MatchScore);
+                    return bestMatch;
+                }
+
+                _logger.LogDebug("未找到任何匹配");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "查找最佳歌词匹配失败");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 计算匹配结果，返回详细信息
+        /// </summary>
+        private MatchResult CalculateMatchResult(SongInfo songInfo, LyricsFileInfo lyricsFile)
+        {
+            var lyricsFileName = Path.GetFileNameWithoutExtension(lyricsFile.Name);
+            var cleanedLyricsName = CleanText(lyricsFileName);
+
+            // 检查是否包含"歌词"关键词（非必须，但加分）
+            bool hasLyricsKeyword = cleanedLyricsName.Contains("歌词") || lyricsFileName.Contains("歌词");
+
+            // 开始匹配
+            double matchScore = hasLyricsKeyword ? 0.1 : 0.0;
+            var matchedChars = new List<string>();
+            var matchedMultiChars = new List<string>();
+
+            // 1. 匹配歌名字符
+            if (!string.IsNullOrEmpty(songInfo.CleanedSongName))
+            {
+                int charMatches = 0;
+                foreach (var c in songInfo.CleanedSongName)
+                {
+                    var charStr = c.ToString();
+                    if (cleanedLyricsName.Contains(charStr))
+                    {
+                        charMatches++;
+                        matchedChars.Add(charStr);
+                    }
+                }
+
+                if (charMatches > 0)
+                {
+                    double charMatchRatio = (double)charMatches / songInfo.CleanedSongName.Length;
+                    matchScore += charMatchRatio * 0.6; // 占60%权重
+
+                    // 连续匹配奖励
+                    if (cleanedLyricsName.Contains(songInfo.CleanedSongName))
+                    {
+                        matchScore += 0.3; // 完整匹配加30%
+                        matchedMultiChars.Add(songInfo.CleanedSongName);
+                    }
+                    else
+                    {
+                        // 查找最长连续匹配
+                        int longestMatch = 0;
+                        string longestSubstring = "";
+
+                        for (int i = 0; i < songInfo.CleanedSongName.Length; i++)
+                        {
+                            for (int j = i + 2; j <= songInfo.CleanedSongName.Length; j++)
+                            {
+                                var substring = songInfo.CleanedSongName.Substring(i, j - i);
+                                if (cleanedLyricsName.Contains(substring) && substring.Length > longestMatch)
+                                {
+                                    longestMatch = substring.Length;
+                                    longestSubstring = substring;
+                                }
+                            }
+                        }
+
+                        if (longestMatch >= 2)
+                        {
+                            matchScore += longestMatch * 0.05; // 每个连续匹配的字加5%
+                            if (!string.IsNullOrEmpty(longestSubstring))
+                            {
+                                matchedMultiChars.Add(longestSubstring);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. 匹配歌手名字符（如果有）
+            if (!string.IsNullOrEmpty(songInfo.CleanedArtist))
+            {
+                int artistMatches = 0;
+                foreach (var c in songInfo.CleanedArtist)
+                {
+                    var charStr = c.ToString();
+                    if (cleanedLyricsName.Contains(charStr))
+                    {
+                        artistMatches++;
+                        matchedChars.Add(charStr);
+                    }
+                }
+
+                if (artistMatches > 0)
+                {
+                    double artistMatchRatio = (double)artistMatches / songInfo.CleanedArtist.Length;
+                    matchScore += artistMatchRatio * 0.3; // 占30%权重
+                }
+            }
+
+            // 至少需要匹配1个字符（非常宽松的条件）
+            if (matchedChars.Count == 0 && matchedMultiChars.Count == 0)
+            {
+                return null;
+            }
+
+            return new MatchResult
+            {
+                MatchScore = Math.Min(matchScore, 1.0),
+                HasLyricsKeyword = hasLyricsKeyword,
+                MatchedChars = matchedChars,
+                MatchedMultiChars = matchedMultiChars
+            };
+        }
+
+        /// <summary>
+        /// 从文件名提取歌曲信息
+        /// </summary>
+        private SongInfo ExtractSongInfoFromFileName(string fileName)
+        {
+            var info = new SongInfo
+            {
+                FileName = fileName,
+                CleanedFileName = CleanText(fileName)
+            };
+
+            // 常见的分隔符
+            var separators = new[] { "-", "–", "—", "_", "~", "·", " ", "　" };
+
+            // 尝试用分隔符分割
+            foreach (var sep in separators)
+            {
+                if (fileName.Contains(sep))
+                {
+                    var parts = fileName.Split(new[] { sep }, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length >= 2)
+                    {
+                        // 假设第一个是歌名，最后一个是歌手
+                        info.SongName = parts[0].Trim();
+                        info.Artist = parts[^1].Trim();
+
+                        info.CleanedSongName = CleanText(info.SongName);
+                        info.CleanedArtist = CleanText(info.Artist);
+
+                        break;
+                    }
+                }
+            }
+
+            // 如果没有分隔符，整个文件名作为歌名
+            if (string.IsNullOrEmpty(info.SongName))
+            {
+                info.SongName = fileName;
+                info.CleanedSongName = info.CleanedFileName;
+            }
+
+            return info;
+        }
+
+        /// <summary>
+        /// 清理文本，去除所有符号只保留文字
+        /// </summary>
+        private string CleanText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            var result = new StringBuilder();
+
+            foreach (char c in text)
+            {
+                // 保留中文字符
+                if (c >= 0x4E00 && c <= 0x9FFF)
+                {
+                    result.Append(c);
+                }
+                // 保留英文字母（统一转小写）
+                else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+                {
+                    result.Append(char.ToLowerInvariant(c));
+                }
+                // 保留数字
+                else if (c >= '0' && c <= '9')
+                {
+                    result.Append(c);
+                }
+            }
+
+            return result.ToString();
+        }
+
+
+        #endregion
 
         [HttpGet("lyrics/files/{*directory}")]
         public async Task<IActionResult> GetLyricsFiles(string directory)
@@ -1611,7 +2047,181 @@ namespace FileServer.Controllers
 
             return lyricsFiles;
         }
+        #region 歌曲元数据与封面端点
 
+        [HttpGet("song/metadata/{*path}")]
+        public async Task<IActionResult> GetSongMetadata(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+
+                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+                if (!await _fileService.FileExistsAsync(path))
+                    return NotFound(new { error = "文件不存在" });
+
+                var metadata = await _audioMetadataService.GetMetadataAsync(fullPath);
+                return Ok(new
+                {
+                    path,
+                    fileName = Path.GetFileName(path),
+                    metadata
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取歌曲元数据失败: {Path}", path);
+                return StatusCode(500, new { error = "获取元数据失败", message = ex.Message });
+            }
+        }
+
+        [HttpPost("song/metadata/mapping")]
+        public async Task<IActionResult> SaveSongMetadataMapping([FromBody] SaveMetadataMappingRequest request)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                if (string.IsNullOrEmpty(request.SongPath))
+                    return BadRequest(new { error = "歌曲路径不能为空" });
+
+                request.SongPath = WebUtility.UrlDecode(request.SongPath);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), request.SongPath);
+                if (!await _fileService.FileExistsAsync(request.SongPath))
+                    return NotFound(new { error = "歌曲文件不存在" });
+
+                var metadata = new SongMetadata
+                {
+                    Title = request.Title ?? "",
+                    Artist = request.Artist ?? "",
+                    Album = request.Album ?? "",
+                    HasCover = false,
+                    CustomCoverPath = null
+                };
+
+                var result = await _audioMetadataService.SaveMetadataMappingAsync(fullPath, metadata);
+                if (result)
+                    return Ok(new { success = true, message = "元数据映射保存成功" });
+                else
+                    return StatusCode(500, new { error = "保存失败" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存元数据映射失败");
+                return StatusCode(500, new { error = "保存失败", message = ex.Message });
+            }
+        }
+
+        [HttpDelete("song/metadata/mapping/{*path}")]
+        public async Task<IActionResult> DeleteSongMetadataMapping(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+
+                var result = await _audioMetadataService.DeleteMetadataMappingAsync(fullPath);
+                if (result)
+                    return Ok(new { success = true, message = "元数据映射已删除" });
+                else
+                    return NotFound(new { error = "未找到映射" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除元数据映射失败");
+                return StatusCode(500, new { error = "删除失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("song/cover/{*path}")]
+        public async Task<IActionResult> GetAlbumCover(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+
+                if (!await _fileService.FileExistsAsync(path))
+                    return NotFound(new { error = "文件不存在" });
+
+                var coverStream = await _audioMetadataService.GetAlbumCoverAsync(fullPath);
+                if (coverStream == null)
+                    return NotFound(new { error = "没有封面图片" });
+
+                Response.Headers.Append("Cache-Control", "public, max-age=86400");
+                return File(coverStream, "image/jpeg"); // 可根据实际类型调整
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取专辑封面失败");
+                return StatusCode(500, new { error = "获取封面失败", message = ex.Message });
+            }
+        }
+
+        [HttpPost("song/cover/upload")]
+        [RequestSizeLimit(10 * 1024 * 1024)] // 10MB
+        public async Task<IActionResult> UploadAlbumCover([FromForm] CoverUploadRequest request)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                if (string.IsNullOrEmpty(request.SongPath))
+                    return BadRequest(new { error = "歌曲路径不能为空" });
+                if (request.CoverFile == null || request.CoverFile.Length == 0)
+                    return BadRequest(new { error = "请选择图片文件" });
+
+                request.SongPath = WebUtility.UrlDecode(request.SongPath);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), request.SongPath);
+                if (!await _fileService.FileExistsAsync(request.SongPath))
+                    return NotFound(new { error = "歌曲文件不存在" });
+
+                var allowedExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp" };
+                var ext = Path.GetExtension(request.CoverFile.FileName).ToLowerInvariant();
+                if (!allowedExtensions.Contains(ext))
+                    return BadRequest(new { error = "不支持的图片格式" });
+
+                await using var stream = request.CoverFile.OpenReadStream();
+                var savedName = await _audioMetadataService.SaveCustomCoverAsync(fullPath, stream, request.CoverFile.FileName);
+                if (savedName != null)
+                    return Ok(new { success = true, message = "封面上传成功", coverPath = savedName });
+                else
+                    return StatusCode(500, new { error = "保存封面失败" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "上传专辑封面失败");
+                return StatusCode(500, new { error = "上传失败", message = ex.Message });
+            }
+        }
+
+        [HttpDelete("song/cover/{*path}")]
+        public async Task<IActionResult> DeleteAlbumCover(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+
+                if (!await _fileService.FileExistsAsync(path))
+                    return NotFound(new { error = "歌曲文件不存在" });
+
+                var result = await _audioMetadataService.DeleteCustomCoverAsync(fullPath);
+                if (result)
+                    return Ok(new { success = true, message = "自定义封面已删除" });
+                else
+                    return NotFound(new { error = "没有找到自定义封面" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除专辑封面失败");
+                return StatusCode(500, new { error = "删除失败", message = ex.Message });
+            }
+        }
+
+        #endregion
         private bool IsLyricsFile(string fileName)
         {
             var extension = Path.GetExtension(fileName).ToLowerInvariant();

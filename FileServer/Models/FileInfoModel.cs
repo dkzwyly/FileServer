@@ -1,5 +1,15 @@
 ﻿namespace FileServer.Models
 {
+    public class FileItem
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Path { get; set; } = string.Empty;
+        public long Size { get; set; }
+        public string SizeFormatted { get; set; } = string.Empty;
+        public DateTime LastModified { get; set; }
+        public bool IsDirectory { get; set; }
+    }
+
     // 原有的 FileInfoModel（保持不变）
     public class FileInfoModel
     {

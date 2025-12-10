@@ -24,6 +24,8 @@ builder.Services.AddScoped<IFileService, FileService>();
 builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
 builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
 builder.Services.AddScoped<IFileConflictService, FileConflictService>();
+builder.Services.AddScoped<IAudioMetadataService, AudioMetadataService>();
+builder.Services.AddScoped<IPhotoMetadataService, PhotoMetadataService>();
 
 // 5. VideoThumbnailService
 builder.Services.AddSingleton<VideoThumbnailService>();
