@@ -1214,6 +1214,8 @@ namespace FileServer.Controllers
             }
         }
         #region 歌词相关端点
+        
+
 
         [HttpPost("lyrics/mapping")]
         public async Task<IActionResult> SaveLyricsMapping([FromBody] LyricsMappingRequest request)
@@ -1318,18 +1320,37 @@ namespace FileServer.Controllers
                     return await GetLyricsContent(mappedLyricsPath);
                 }
 
-                // 2. 如果没有映射，尝试在同目录下查找同名的.lrc文件
+                // 2. 如果没有映射，尝试智能匹配
                 var directory = Path.GetDirectoryName(songPath);
-                var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(songPath);
-                var possibleLyricsPath = Path.Combine(directory, fileNameWithoutExtension + ".lrc");
+                var fileName = Path.GetFileNameWithoutExtension(songPath);
 
+                // 智能匹配查找最佳匹配（无论置信度如何，只要有匹配就返回）
+                var bestLyricsMatch = await FindBestLyricsMatch(songPath, fileName, directory);
+
+                if (bestLyricsMatch != null && bestLyricsMatch.LyricsFile != null)
+                {
+                    // 找到匹配，自动保存映射
+                    await SaveLyricsMappingToFile(new LyricsMappingRequest
+                    {
+                        SongPath = songPath,
+                        LyricsPath = bestLyricsMatch.LyricsFile.Path
+                    });
+
+                    _logger.LogInformation("智能匹配成功并建立映射: {SongPath} -> {LyricsPath}, 分数: {Score}",
+                        songPath, bestLyricsMatch.LyricsFile.Path, bestLyricsMatch.MatchScore);
+
+                    return await GetLyricsContent(bestLyricsMatch.LyricsFile.Path);
+                }
+
+                // 3. 如果智能匹配失败（没有找到任何匹配），尝试在同目录下查找同名的.lrc文件
+                var possibleLyricsPath = Path.Combine(directory, fileName + ".lrc");
                 if (await _fileService.FileExistsAsync(possibleLyricsPath))
                 {
                     _logger.LogInformation("找到同名歌词文件: {LyricsPath}", possibleLyricsPath);
                     return await GetLyricsContent(possibleLyricsPath);
                 }
 
-                // 3. 查找同目录下其他歌词文件
+                // 4. 查找同目录下其他歌词文件
                 var lyricsFiles = await FindLyricsFilesInDirectory(directory);
                 if (lyricsFiles.Any())
                 {
@@ -1351,6 +1372,263 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取歌词失败", message = ex.Message });
             }
         }
+
+
+        #region 智能匹配方法
+
+        /// <summary>
+        /// 在同级目录中查找最佳歌词匹配
+        /// </summary>
+        /// <summary>
+        /// 在同级目录中查找最佳歌词匹配
+        /// </summary>
+        private async Task<BestLyricsMatch> FindBestLyricsMatch(string songPath, string songFileName, string directory)
+        {
+            try
+            {
+                // 获取同级目录中的所有歌词文件
+                var lyricsFiles = await FindLyricsFilesInDirectory(directory);
+
+                if (!lyricsFiles.Any())
+                {
+                    return null;
+                }
+
+                // 从歌曲文件名提取信息
+                var songInfo = ExtractSongInfoFromFileName(songFileName);
+                _logger.LogDebug("提取歌曲信息: {FileName} -> 歌名: {SongName}, 歌手: {Artist}",
+                    songFileName, songInfo.SongName, songInfo.Artist);
+
+                BestLyricsMatch bestMatch = null;
+                double bestScore = 0;
+
+                // 对每个歌词文件计算匹配分数
+                foreach (var lyricsFile in lyricsFiles)
+                {
+                    var matchResult = CalculateMatchResult(songInfo, lyricsFile);
+
+                    if (matchResult != null && (bestMatch == null || matchResult.MatchScore > bestScore))
+                    {
+                        bestScore = matchResult.MatchScore;
+                        bestMatch = new BestLyricsMatch
+                        {
+                            LyricsFile = lyricsFile,
+                            MatchScore = matchResult.MatchScore,
+                            MatchedChars = matchResult.MatchedChars,
+                            MatchedMultiChars = matchResult.MatchedMultiChars,
+                            HasLyricsKeyword = matchResult.HasLyricsKeyword
+                        };
+
+                        _logger.LogDebug("更新最佳匹配: {LyricsFile} -> 分数: {Score}",
+                            lyricsFile.Name, matchResult.MatchScore);
+                    }
+                }
+
+                // 只要有匹配就返回（无论分数高低）
+                if (bestMatch != null)
+                {
+                    _logger.LogInformation("找到最佳歌词匹配: {LyricsPath}, 分数: {Score}",
+                        bestMatch.LyricsFile.Path, bestMatch.MatchScore);
+                    return bestMatch;
+                }
+
+                _logger.LogDebug("未找到任何匹配");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "查找最佳歌词匹配失败");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 计算匹配结果，返回详细信息
+        /// </summary>
+        private MatchResult CalculateMatchResult(SongInfo songInfo, LyricsFileInfo lyricsFile)
+        {
+            var lyricsFileName = Path.GetFileNameWithoutExtension(lyricsFile.Name);
+            var cleanedLyricsName = CleanText(lyricsFileName);
+
+            // 检查是否包含"歌词"关键词（非必须，但加分）
+            bool hasLyricsKeyword = cleanedLyricsName.Contains("歌词") || lyricsFileName.Contains("歌词");
+
+            // 开始匹配
+            double matchScore = hasLyricsKeyword ? 0.1 : 0.0;
+            var matchedChars = new List<string>();
+            var matchedMultiChars = new List<string>();
+
+            // 1. 匹配歌名字符
+            if (!string.IsNullOrEmpty(songInfo.CleanedSongName))
+            {
+                int charMatches = 0;
+                foreach (var c in songInfo.CleanedSongName)
+                {
+                    var charStr = c.ToString();
+                    if (cleanedLyricsName.Contains(charStr))
+                    {
+                        charMatches++;
+                        matchedChars.Add(charStr);
+                    }
+                }
+
+                if (charMatches > 0)
+                {
+                    double charMatchRatio = (double)charMatches / songInfo.CleanedSongName.Length;
+                    matchScore += charMatchRatio * 0.6; // 占60%权重
+
+                    // 连续匹配奖励
+                    if (cleanedLyricsName.Contains(songInfo.CleanedSongName))
+                    {
+                        matchScore += 0.3; // 完整匹配加30%
+                        matchedMultiChars.Add(songInfo.CleanedSongName);
+                    }
+                    else
+                    {
+                        // 查找最长连续匹配
+                        int longestMatch = 0;
+                        string longestSubstring = "";
+
+                        for (int i = 0; i < songInfo.CleanedSongName.Length; i++)
+                        {
+                            for (int j = i + 2; j <= songInfo.CleanedSongName.Length; j++)
+                            {
+                                var substring = songInfo.CleanedSongName.Substring(i, j - i);
+                                if (cleanedLyricsName.Contains(substring) && substring.Length > longestMatch)
+                                {
+                                    longestMatch = substring.Length;
+                                    longestSubstring = substring;
+                                }
+                            }
+                        }
+
+                        if (longestMatch >= 2)
+                        {
+                            matchScore += longestMatch * 0.05; // 每个连续匹配的字加5%
+                            if (!string.IsNullOrEmpty(longestSubstring))
+                            {
+                                matchedMultiChars.Add(longestSubstring);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. 匹配歌手名字符（如果有）
+            if (!string.IsNullOrEmpty(songInfo.CleanedArtist))
+            {
+                int artistMatches = 0;
+                foreach (var c in songInfo.CleanedArtist)
+                {
+                    var charStr = c.ToString();
+                    if (cleanedLyricsName.Contains(charStr))
+                    {
+                        artistMatches++;
+                        matchedChars.Add(charStr);
+                    }
+                }
+
+                if (artistMatches > 0)
+                {
+                    double artistMatchRatio = (double)artistMatches / songInfo.CleanedArtist.Length;
+                    matchScore += artistMatchRatio * 0.3; // 占30%权重
+                }
+            }
+
+            // 至少需要匹配1个字符（非常宽松的条件）
+            if (matchedChars.Count == 0 && matchedMultiChars.Count == 0)
+            {
+                return null;
+            }
+
+            return new MatchResult
+            {
+                MatchScore = Math.Min(matchScore, 1.0),
+                HasLyricsKeyword = hasLyricsKeyword,
+                MatchedChars = matchedChars,
+                MatchedMultiChars = matchedMultiChars
+            };
+        }
+
+        /// <summary>
+        /// 从文件名提取歌曲信息
+        /// </summary>
+        private SongInfo ExtractSongInfoFromFileName(string fileName)
+        {
+            var info = new SongInfo
+            {
+                FileName = fileName,
+                CleanedFileName = CleanText(fileName)
+            };
+
+            // 常见的分隔符
+            var separators = new[] { "-", "–", "—", "_", "~", "·", " ", "　" };
+
+            // 尝试用分隔符分割
+            foreach (var sep in separators)
+            {
+                if (fileName.Contains(sep))
+                {
+                    var parts = fileName.Split(new[] { sep }, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length >= 2)
+                    {
+                        // 假设第一个是歌名，最后一个是歌手
+                        info.SongName = parts[0].Trim();
+                        info.Artist = parts[^1].Trim();
+
+                        info.CleanedSongName = CleanText(info.SongName);
+                        info.CleanedArtist = CleanText(info.Artist);
+
+                        break;
+                    }
+                }
+            }
+
+            // 如果没有分隔符，整个文件名作为歌名
+            if (string.IsNullOrEmpty(info.SongName))
+            {
+                info.SongName = fileName;
+                info.CleanedSongName = info.CleanedFileName;
+            }
+
+            return info;
+        }
+
+        /// <summary>
+        /// 清理文本，去除所有符号只保留文字
+        /// </summary>
+        private string CleanText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            var result = new StringBuilder();
+
+            foreach (char c in text)
+            {
+                // 保留中文字符
+                if (c >= 0x4E00 && c <= 0x9FFF)
+                {
+                    result.Append(c);
+                }
+                // 保留英文字母（统一转小写）
+                else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+                {
+                    result.Append(char.ToLowerInvariant(c));
+                }
+                // 保留数字
+                else if (c >= '0' && c <= '9')
+                {
+                    result.Append(c);
+                }
+            }
+
+            return result.ToString();
+        }
+
+
+        #endregion
 
         [HttpGet("lyrics/files/{*directory}")]
         public async Task<IActionResult> GetLyricsFiles(string directory)
