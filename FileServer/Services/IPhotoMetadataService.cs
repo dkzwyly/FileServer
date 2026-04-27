@@ -9,5 +9,8 @@ namespace FileServer.Services
         Task<(IEnumerable<PhotoMetadata> Items, int TotalCount)> SearchPhotosAsync(PhotoSearchOptions options);
         Task RefreshMetadataAsync(string relativePath);
         Task ScanAndIndexAllPhotosAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default);
+
+        // 新增：扫描配置中指定的图片目录
+        Task ScanConfiguredDirectoriesAsync();
     }
 }

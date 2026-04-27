@@ -93,40 +93,26 @@ namespace FileServer.Controllers
                 // 按拍摄时间排序（仅对图片文件有效）
                 if (sortBy.Equals("dateTaken", StringComparison.OrdinalIgnoreCase))
                 {
+                    // 仅对图片文件附加元数据
                     var imageFiles = result.Files.Where(f => IsImageFile(Path.GetExtension(f.Name))).ToList();
                     if (imageFiles.Any())
                     {
                         var paths = imageFiles.Select(f => f.Path);
                         var metadataDict = await _photoMetadataService.GetBatchMetadataAsync(paths);
 
-                        var filesWithMetadata = result.Files.Select(f =>
+                        // 将元数据直接赋值给 FileInfoModel 对象
+                        foreach (var file in result.Files)
                         {
-                            var item = new FileListItemWithMetadata
-                            {
-                                Name = f.Name,
-                                Path = f.Path,
-                                Size = f.Size,
-                                SizeFormatted = f.SizeFormatted,
-                                LastModified = f.LastModified,
-                            };
-                            if (metadataDict.TryGetValue(f.Path, out var meta))
-                                item.Metadata = meta;
-                            return item;
-                        }).ToList();
+                            if (metadataDict.TryGetValue(file.Path, out var meta))
+                                file.Metadata = meta;
+                        }
 
-                        var sortedFiles = sortOrder.ToLower() == "asc"
-                            ? filesWithMetadata.OrderBy(f => f.Metadata?.DateTaken ?? DateTime.MaxValue).ToList()
-                            : filesWithMetadata.OrderByDescending(f => f.Metadata?.DateTaken ?? DateTime.MinValue).ToList();
+                        // 按 DateTaken 排序（null 值视作 DateTime.MaxValue 排在最后）
+                        result.Files = sortOrder.ToLower() == "asc"
+                            ? result.Files.OrderBy(f => f.Metadata?.DateTaken ?? DateTime.MaxValue).ToList()
+                            : result.Files.OrderByDescending(f => f.Metadata?.DateTaken ?? DateTime.MinValue).ToList();
 
-                        var response = new
-                        {
-                            result.CurrentPath,
-                            result.ParentPath,
-                            Directories = result.Directories,
-                            Files = sortedFiles,
-                            MetadataIncluded = true
-                        };
-                        return Ok(response);
+                        return Ok(result);   // 直接返回标准的 FileListResponse
                     }
                 }
 
@@ -375,6 +361,19 @@ namespace FileServer.Controllers
 
                 if (result.Success)
                 {
+                    // ========== 新增：增量更新照片元数据 ==========
+                    if (result.UploadedFiles != null)
+                    {
+                        foreach (var uploadedFile in result.UploadedFiles.Where(f => f.Success))
+                        {
+                            var extension = Path.GetExtension(uploadedFile.Path).ToLowerInvariant();
+                            if (IsImageFile(extension))
+                            {
+                                _ = _photoMetadataService.GetOrExtractMetadataAsync(uploadedFile.Path);
+                            }
+                        }
+                    }
+                    // ===============================================
                     return Ok(result);
                 }
                 else

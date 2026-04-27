@@ -24,6 +24,7 @@
         public string MimeType { get; set; } = string.Empty;
         public string Encoding { get; set; } = string.Empty;
         public bool HasThumbnail { get; set; }
+        public PhotoMetadata? Metadata { get; set; }
     }
 
     public class DirectoryInfoModel

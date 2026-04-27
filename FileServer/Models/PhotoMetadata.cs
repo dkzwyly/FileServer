@@ -32,9 +32,4 @@ namespace FileServer.Models
         public int Take { get; set; } = 100;
     }
 
-    // 扩展文件列表项，增加元数据（用于排序后返回）
-    public class FileListItemWithMetadata : FileItem
-    {
-        public PhotoMetadata? Metadata { get; set; }
-    }
 }
