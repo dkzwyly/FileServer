@@ -1370,8 +1370,21 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取视频信息失败", message = ex.Message });
             }
         }
+        [HttpPost("photo-metadata/batch")]
+        public async Task<IActionResult> GetBatchPhotoMetadata([FromBody] List<string> paths)
+        {
+            if (paths == null || paths.Count == 0)
+                return BadRequest("paths 不能为空");
+
+            var metadata = await _photoMetadataService.GetBatchMetadataAsync(paths);
+            var result = metadata.ToDictionary(
+                kvp => kvp.Key,
+                kvp => kvp.Value.DateTaken?.ToString("o")   // ISO 8601
+            );
+            return Ok(result);
+        }
         #region 歌词相关端点
-        
+
 
 
         [HttpPost("lyrics/mapping")]

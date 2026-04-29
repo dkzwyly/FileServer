@@ -25,9 +25,9 @@ namespace FileServer.Services
         private static string _metadataFilePath = string.Empty;
 
         public static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif"
-        };
+{
+    ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif", ".gif"
+};
 
         public PhotoMetadataService(IFileService fileService, ILogger<PhotoMetadataService> logger, IConfiguration configuration)
         {
