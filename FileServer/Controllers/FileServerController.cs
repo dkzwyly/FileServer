@@ -1,6 +1,7 @@
 ﻿using FileServer.Models;
 using FileServer.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Memory;
 using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Text;
@@ -20,6 +21,8 @@ namespace FileServer.Controllers
         private readonly IVideoThumbnailService _videoThumbnailService;
         private readonly IAudioMetadataService _audioMetadataService;
         private readonly IPhotoMetadataService _photoMetadataService;
+        private readonly int _charactersPerPage;
+        private readonly IMemoryCache _memoryCache;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
@@ -29,6 +32,7 @@ namespace FileServer.Controllers
                                   IChapterIndexService chapterIndexService,
                                   IVideoThumbnailService videoThumbnailService,
                                   IAudioMetadataService audioMetadataService,
+                                  IMemoryCache memoryCache,
                                   IPhotoMetadataService photoMetadataService)
         {
             _fileService = fileService;
@@ -40,6 +44,8 @@ namespace FileServer.Controllers
             _videoThumbnailService = videoThumbnailService;
             _audioMetadataService = audioMetadataService;
             _photoMetadataService = photoMetadataService;
+            _charactersPerPage = configuration.GetValue<int>("Preview:CharactersPerPage", 5000);
+            _memoryCache = memoryCache;
         }
 
         [HttpGet("status")]
@@ -276,7 +282,7 @@ namespace FileServer.Controllers
         }
 
         [HttpGet("preview/{*path}")]
-        public async Task<IActionResult> PreviewFile(string path, [FromQuery] int page = 1, [FromQuery] int pageSize = 1000)
+        public async Task<IActionResult> PreviewFile(string path, [FromQuery] int page = 1)
         {
             try
             {
@@ -318,8 +324,8 @@ namespace FileServer.Controllers
                 // 对于文本文件，返回JSON内容（支持分页）
                 if (IsTextFile(extension))
                 {
-                    _logger.LogInformation("文本文件预览: {FileName} (页码: {Page}, 页大小: {PageSize})", fileInfo.Name, page, pageSize);
-                    return await HandleTextFilePreview(path, page, pageSize);
+                    _logger.LogInformation("文本文件预览: {FileName} (页码: {Page})", fileInfo.Name, page);
+                    return await HandleTextFilePreview(path, page);
                 }
 
                 // 对于媒体文件，使用内存映射
@@ -566,53 +572,55 @@ namespace FileServer.Controllers
             try
             {
                 _statusService.IncrementRequests();
-
-                // 添加 URL 解码
                 path = WebUtility.UrlDecode(path);
-                _logger.LogInformation("处理章节请求 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
-                    Request.Path.Value, path);
+                _logger.LogInformation("处理章节请求 - 路径: {Path}", path);
 
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+                // 1. 先尝试读取已有的有效索引（不下载文件）
+                var chapterIndex = await _chapterIndexService.GetCachedChapterIndexAsync(path);
 
-                using (stream)
+                // 2. 如果缓存无效或不存在，才下载文件并构建索引
+                if (chapterIndex == null)
                 {
-                    byte[] fileBytes;
-                    using (var memoryStream = new MemoryStream())
+                    // 下载文件内容
+                    var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+                    using (stream)
                     {
-                        await stream.CopyToAsync(memoryStream);
-                        fileBytes = memoryStream.ToArray();
-                    }
-
-                    string content;
-                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
-                    }
-                    else
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes);
-                    }
-
-                    var chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
-
-                    if (chapterIndex == null)
-                    {
-                        return NotFound(new { error = "无法构建章节索引" });
-                    }
-
-                    return Ok(new
-                    {
-                        fileName,
-                        totalChapters = chapterIndex.TotalChapters,
-                        chapters = chapterIndex.Chapters.Select(c => new
+                        byte[] fileBytes;
+                        using (var memoryStream = new MemoryStream())
                         {
-                            title = c.Title,
-                            page = c.Page,
-                            lineNumber = c.LineNumber,
-                            preview = c.Preview
-                        })
-                    });
+                            await stream.CopyToAsync(memoryStream);
+                            fileBytes = memoryStream.ToArray();
+                        }
+
+                        string content;
+                        if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
+                            content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
+                        else
+                            content = Encoding.UTF8.GetString(fileBytes);
+
+                        // 构建并保存索引
+                        chapterIndex = await _chapterIndexService.BuildChapterIndexAsync(path, content);
+                    }
                 }
+
+                if (chapterIndex == null)
+                    return NotFound(new { error = "无法构建章节索引" });
+
+                // 3. 根据固定每页字符数计算大页码
+                var chaptersResponse = chapterIndex.Chapters.Select(c => new
+                {
+                    title = c.Title,
+                    page = (c.StartCharOffset / _charactersPerPage) + 1,
+                    preview = c.Preview,
+                    startCharOffset = c.StartCharOffset
+                });
+
+                return Ok(new
+                {
+                    fileName = Path.GetFileName(path),
+                    totalChapters = chapterIndex.TotalChapters,
+                    chapters = chaptersResponse
+                });
             }
             catch (Exception ex)
             {
@@ -628,10 +636,8 @@ namespace FileServer.Controllers
             {
                 _statusService.IncrementRequests();
 
-                // 添加 URL 解码
                 path = WebUtility.UrlDecode(path);
-                _logger.LogInformation("重建章节索引 - 解码前: {OriginalPath}, 解码后: {DecodedPath}",
-                    Request.Path.Value, path);
+                _logger.LogInformation("重建章节索引 - 解码后路径: {DecodedPath}", path);
 
                 var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
 
@@ -656,19 +662,21 @@ namespace FileServer.Controllers
 
                     var chapterIndex = await _chapterIndexService.ForceRebuildChapterIndexAsync(path, content);
 
+                    // 根据固定每页字符数计算大页码
+                    var chaptersResponse = chapterIndex.Chapters.Select(c => new
+                    {
+                        title = c.Title,
+                        page = (c.StartCharOffset / _charactersPerPage) + 1,
+                        preview = c.Preview
+                    });
+
                     return Ok(new
                     {
                         success = true,
                         message = "章节索引重建完成",
                         fileName,
                         totalChapters = chapterIndex.TotalChapters,
-                        chapters = chapterIndex.Chapters.Select(c => new
-                        {
-                            title = c.Title,
-                            page = c.Page,
-                            lineNumber = c.LineNumber,
-                            preview = c.Preview
-                        })
+                        chapters = chaptersResponse
                     });
                 }
             }
@@ -1032,122 +1040,78 @@ namespace FileServer.Controllers
             }
         }
 
-        private async Task<IActionResult> HandleTextFilePreview(string path, int page = 1, int pageSize = 1000)
+        private async Task<IActionResult> HandleTextFilePreview(string path, int page = 1)
         {
             try
             {
-                var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+                // 获取文件信息用于缓存键和有效性验证
+                var fileInfo = await _fileService.GetFileInfoAsync(path);
+                string cacheKey = $"text_{path}_{fileInfo.LastModified.Ticks}";
 
-                using (stream)
+                // 尝试从缓存获取完整的文本内容
+                if (!_memoryCache.TryGetValue<string>(cacheKey, out var fullContent))
                 {
-                    // 读取整个文件到内存（性能优先）
-                    byte[] fileBytes;
-                    using (var memoryStream = new MemoryStream())
+                    // 缓存不存在，读取文件并解码
+                    var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
+                    using (stream)
                     {
-                        await stream.CopyToAsync(memoryStream);
-                        fileBytes = memoryStream.ToArray();
-                    }
-
-                    // 检测并处理 UTF-8 BOM
-                    string content;
-                    if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
-                    }
-                    else
-                    {
-                        content = Encoding.UTF8.GetString(fileBytes);
-                    }
-
-                    // 按行分割
-                    var lines = content.Split('\n');
-                    var totalLines = lines.Length;
-
-                    // 计算分页
-                    if (page < 1) page = 1;
-                    if (pageSize < 1) pageSize = 1000;
-                    if (pageSize > 10000) pageSize = 10000;
-
-                    var totalPages = (int)Math.Ceiling((double)totalLines / pageSize);
-                    var startIndex = (page - 1) * pageSize;
-                    var endIndex = Math.Min(startIndex + pageSize, totalLines);
-
-                    // 获取当前页的内容
-                    var pageLines = new List<string>();
-                    for (int i = startIndex; i < endIndex; i++)
-                    {
-                        pageLines.Add(lines[i].TrimEnd('\r'));
-                    }
-
-                    var pageContent = string.Join("\n", pageLines);
-
-                    // 获取或构建章节索引（只在第一页请求时构建，避免重复工作）
-                    ChapterIndex chapterIndex = null;
-                    if (page == 1)
-                    {
-                        chapterIndex = await _chapterIndexService.GetOrBuildChapterIndexAsync(path, content);
-                        _logger.LogInformation("章节索引处理完成: {FileName}, 章节数: {ChapterCount}",
-                            fileName, chapterIndex?.TotalChapters ?? 0);
-                    }
-
-                    _logger.LogInformation("文本文件分页预览 - 文件: {FileName}, 页码: {Page}, 页大小: {PageSize}, 总行数: {TotalLines}, 总页数: {TotalPages}",
-                        fileName, page, pageSize, totalLines, totalPages);
-
-                    // 构建响应对象
-                    var response = new
-                    {
-                        type = "text",
-                        fileName,
-                        content = pageContent,
-                        encoding = "utf-8",
-                        pagination = new
+                        byte[] fileBytes;
+                        using (var memoryStream = new MemoryStream())
                         {
-                            currentPage = page,
-                            pageSize = pageSize,
-                            totalLines = totalLines,
-                            totalPages = totalPages,
-                            hasPrevious = page > 1,
-                            hasNext = page < totalPages,
-                            startLine = startIndex + 1,
-                            endLine = endIndex
-                        },
-                        fileInfo = new
-                        {
-                            size = fileBytes.Length,
-                            lines = totalLines,
-                            hasBom = fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF
+                            await stream.CopyToAsync(memoryStream);
+                            fileBytes = memoryStream.ToArray();
                         }
-                    };
 
-                    // 如果有章节信息，添加到响应中
-                    if (chapterIndex != null)
-                    {
-                        var responseWithChapters = new
-                        {
-                            response.type,
-                            response.fileName,
-                            response.content,
-                            response.encoding,
-                            response.pagination,
-                            response.fileInfo,
-                            chapters = new
-                            {
-                                total = chapterIndex.TotalChapters,
-                                list = chapterIndex.Chapters.Select(c => new
-                                {
-                                    title = c.Title,
-                                    page = c.Page,
-                                    line = c.LineNumber,
-                                    preview = c.Preview
-                                }).ToArray()
-                            }
-                        };
-
-                        return Ok(responseWithChapters);
+                        if (fileBytes.Length >= 3 && fileBytes[0] == 0xEF && fileBytes[1] == 0xBB && fileBytes[2] == 0xBF)
+                            fullContent = Encoding.UTF8.GetString(fileBytes, 3, fileBytes.Length - 3);
+                        else
+                            fullContent = Encoding.UTF8.GetString(fileBytes);
                     }
 
-                    return Ok(response);
+                    // 缓存策略：滑动过期 30 分钟，绝对过期 2 小时，大小限制由 MemoryCache 选项控制
+                    var cacheEntryOptions = new MemoryCacheEntryOptions()
+                        .SetSlidingExpiration(TimeSpan.FromMinutes(30))
+                        .SetAbsoluteExpiration(TimeSpan.FromHours(2))
+                        .SetPriority(CacheItemPriority.Normal);
+
+                    _memoryCache.Set(cacheKey, fullContent, cacheEntryOptions);
                 }
+
+                // 分页逻辑（按字符数计算偏移）
+                int totalChars = fullContent.Length;
+                int startChar = (page - 1) * _charactersPerPage;
+                if (startChar >= totalChars)
+                    startChar = totalChars;
+                int endChar = Math.Min(startChar + _charactersPerPage, totalChars);
+                string pageContent = fullContent.Substring(startChar, endChar - startChar);
+                int totalPages = (int)Math.Ceiling((double)totalChars / _charactersPerPage);
+
+                var response = new
+                {
+                    type = "text",
+                    fileName = Path.GetFileName(path),
+                    content = pageContent,
+                    encoding = "utf-8",
+                    pagination = new
+                    {
+                        currentPage = page,
+                        pageSize = _charactersPerPage,
+                        totalChars = totalChars,
+                        totalPages = totalPages,
+                        startChar = startChar,
+                        endChar = endChar,
+                        hasPrevious = page > 1,
+                        hasNext = page < totalPages
+                    },
+                    fileInfo = new
+                    {
+                        size = totalChars,   // 字符数，不是字节数
+                        chars = totalChars,
+                        hasBom = false       // 已在解码时处理
+                    }
+                };
+
+                return Ok(response);
             }
             catch (Exception ex)
             {
@@ -1155,6 +1119,7 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "文本文件预览失败", message = ex.Message });
             }
         }
+
         // 添加视频缩略图端点
         [HttpPost("video-thumbnail/generate")]
         public async Task<IActionResult> GenerateVideoThumbnail([FromBody] VideoThumbnailRequest request)

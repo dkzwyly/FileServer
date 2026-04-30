@@ -22,6 +22,11 @@ namespace FileServer.Services
         List<string> GetAllIndexFilesInfo();
         Task<ChapterIndex> ForceRebuildChapterIndexAsync(string filePath, string content);
         string GetIndexFileInfo(string filePath);
+        /// <summary>
+        /// 尝试仅从缓存加载章节索引，文件未修改时返回有效索引，否则返回 null。
+        /// 此方法不下载源文件，仅检查已存在的索引。
+        /// </summary>
+        Task<ChapterIndex?> GetCachedChapterIndexAsync(string filePath);
     }
 
     public class ChapterIndexService : IChapterIndexService
@@ -41,6 +46,27 @@ namespace FileServer.Services
                 Directory.CreateDirectory(_indexBasePath);
                 _logger.LogInformation("创建章节索引目录: {Path}", _indexBasePath);
             }
+        }
+
+        /// <summary>
+        /// 尝试仅从缓存加载有效索引，不下载源文件。
+        /// </summary>
+        public async Task<ChapterIndex?> GetCachedChapterIndexAsync(string filePath)
+        {
+            try
+            {
+                var index = await LoadChapterIndexAsync(filePath);
+                if (index != null && await IsIndexValidAsync(filePath, index))
+                {
+                    _logger.LogDebug("使用缓存的章节索引: {FilePath}, 章节数: {ChapterCount}", filePath, index.TotalChapters);
+                    return index;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "读取缓存章节索引失败: {FilePath}", filePath);
+            }
+            return null;
         }
 
         public async Task<ChapterIndex?> GetOrBuildChapterIndexAsync(string filePath, string content)
@@ -69,11 +95,48 @@ namespace FileServer.Services
         public async Task<ChapterIndex> BuildChapterIndexAsync(string filePath, string content)
         {
             var fileInfo = await _fileService.GetFileInfoAsync(filePath);
-            var lines = content.Split('\n');
 
-            _logger.LogInformation("开始构建章节索引: {FilePath}, 总行数: {LineCount}", filePath, lines.Length);
+            // 步骤1：顺序解析，记录所有行内容和每行的起始字符偏移（绝对正确）
+            var lines = new List<string>();
+            var lineOffsets = new List<int>();
+            int pos = 0;
+            int contentLength = content.Length;
+            while (pos < contentLength)
+            {
+                lineOffsets.Add(pos);
+                int start = pos;
+                while (pos < contentLength && content[pos] != '\r' && content[pos] != '\n')
+                    pos++;
+                lines.Add(content.Substring(start, pos - start));
+                // 跳过换行符
+                if (pos < contentLength && content[pos] == '\r') pos++;
+                if (pos < contentLength && content[pos] == '\n') pos++;
+            }
 
-            var chapters = DetectChapters(lines);
+            var linesArray = lines.ToArray();
+            var offsetsArray = lineOffsets.ToArray();
+            var patterns = GetChapterPatterns();
+
+            // 步骤2：并行检测章节行（只读，线程安全）
+            var chapterBag = new System.Collections.Concurrent.ConcurrentBag<(int LineIndex, ChapterInfo Chapter)>();
+
+            Parallel.For(0, linesArray.Length, i =>
+            {
+                string line = linesArray[i];
+                if (IsChapterLine(line, patterns, i, linesArray))
+                {
+                    var chapter = new ChapterInfo
+                    {
+                        Title = line.Trim(),
+                        StartCharOffset = offsetsArray[i],   // 关键：使用预存的正确偏移
+                        Preview = GetPreviewText(linesArray, i, 2)
+                    };
+                    chapterBag.Add((i, chapter));
+                }
+            });
+
+            // 步骤3：按原始行号排序，保持章节顺序
+            var chapters = chapterBag.OrderBy(x => x.LineIndex).Select(x => x.Chapter).ToList();
 
             var index = new ChapterIndex
             {
@@ -86,49 +149,7 @@ namespace FileServer.Services
             };
 
             await SaveChapterIndexAsync(filePath, index);
-
-            // 记录检测统计
-            var chapterTitles = string.Join(", ", chapters.Take(10).Select(c => $"\"{c.Title}\""));
-            _logger.LogInformation("章节索引构建完成: {FilePath}, 章节数: {ChapterCount}", filePath, chapters.Count);
-            if (chapters.Count > 10)
-            {
-                _logger.LogDebug("前10个章节: {ChapterTitles}...", chapterTitles);
-            }
-            else
-            {
-                _logger.LogDebug("检测到的章节: {ChapterTitles}", chapterTitles);
-            }
-
             return index;
-        }
-
-        private List<ChapterInfo> DetectChapters(string[] lines)
-        {
-            var chapters = new List<ChapterInfo>();
-            var chapterPatterns = GetChapterPatterns();
-
-            for (int i = 0; i < lines.Length; i++)
-            {
-                var line = lines[i].Trim();
-                if (string.IsNullOrEmpty(line) || line.Length < 2) continue;
-
-                // 使用改进的章节检测逻辑
-                if (IsChapterLine(line, chapterPatterns, i, lines))
-                {
-                    var chapter = new ChapterInfo
-                    {
-                        Title = line.Trim(),
-                        Page = CalculatePageFromLineNumber(i),
-                        LineNumber = i,
-                        Preview = GetPreviewText(lines, i, 2)
-                    };
-
-                    chapters.Add(chapter);
-                    _logger.LogDebug("检测到章节: {Title}, 行号: {LineNumber}", chapter.Title, i);
-                }
-            }
-
-            return chapters;
         }
 
         private bool IsChapterLine(string line, List<Regex> patterns, int lineNumber, string[] allLines)
@@ -179,10 +200,10 @@ namespace FileServer.Services
 
             // 强对话特征：对话动词等（但排除出现在行首的情况）
             var strongDialogueIndicators = new[] {
-        "问道", "说道", "回答", "心想", "问", "答",
-        "说", "喊", "叫", "笑道", "冷笑道", "怒道", "喝道",
-        "大声", "小声", "轻声", "喃喃", "嘀咕"
-    };
+                "问道", "说道", "回答", "心想", "问", "答",
+                "说", "喊", "叫", "笑道", "冷笑道", "怒道", "喝道",
+                "大声", "小声", "轻声", "喃喃", "嘀咕"
+            };
 
             foreach (var indicator in strongDialogueIndicators)
             {
@@ -216,9 +237,9 @@ namespace FileServer.Services
 
                 // 如果"一回"后面跟着动词或地点描述，很可能是叙述
                 var narrativeIndicators = new[] {
-            "到", "在", "就", "看到", "遇到", "发现", "开始",
-            "来到", "进入", "走到", "见到", "想起", "发现"
-        };
+                    "到", "在", "就", "看到", "遇到", "发现", "开始",
+                    "来到", "进入", "走到", "见到", "想起", "发现"
+                };
 
                 if (narrativeIndicators.Any(indicator => after.StartsWith(indicator)))
                 {
@@ -326,7 +347,6 @@ namespace FileServer.Services
         private bool HasReasonableChapterFormat(string line)
         {
             // 章节标题应该相对干净，但允许一些常见的格式
-
             var trimmed = line.Trim();
 
             // 不允许以句号、逗号等正文标点开头
@@ -335,7 +355,7 @@ namespace FileServer.Services
                 return false;
 
             // 不允许包含多个连续的特殊字符（除了章节标记）
-            if (Regex.IsMatch(trimmed, @"[\.\-\\*#]{3,}"))
+            if (Regex.IsMatch(trimmed, @"[.\-\\\*#]{3,}"))
                 return false;
 
             return true;
@@ -361,46 +381,44 @@ namespace FileServer.Services
             var optionalTitle = @".*?";
 
             var patterns = new List<Regex>
-    {
-        // 1. 标准格式：第X章[任意空白][冒号(可选)][任意空白][标题]
-        new Regex($@"^第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
+            {
+                // 1. 标准格式：第X章[任意空白][冒号(可选)][任意空白][标题]
+                new Regex($@"^第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
 
-        // 2. 特殊章节（无数字）
-        new Regex(@"^(序章|前言|后记|楔子|尾声|结局|完结|终章|附录|外传)$", RegexOptions.Compiled),
-        new Regex($@"^(序章|前言|后记|楔子|尾声|结局|完结|终章|附录|外传){anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
+                // 2. 特殊章节（无数字）
+                new Regex(@"^(序章|前言|后记|楔子|尾声|结局|完结|终章|附录|外传)$", RegexOptions.Compiled),
+                new Regex($@"^(序章|前言|后记|楔子|尾声|结局|完结|终章|附录|外传){anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
 
-        // 3. 带"正文"前缀
-        new Regex($@"^正文{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
+                // 3. 带"正文"前缀
+                new Regex($@"^正文{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
 
-        // 4. 符号包裹格式（###、***、---、===），符号内外允许任意空白
-        new Regex($@"^#+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}#+$", RegexOptions.Compiled),
-        new Regex($@"^\*+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}\*+$", RegexOptions.Compiled),
-        new Regex($@"^-+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}-+$", RegexOptions.Compiled),
-        new Regex($@"^=+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}=+$", RegexOptions.Compiled),
+                // 4. 符号包裹格式（###、***、---、===），符号内外允许任意空白
+                new Regex($@"^#+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}#+$", RegexOptions.Compiled),
+                new Regex($@"^\*+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}\*+$", RegexOptions.Compiled),
+                new Regex($@"^-+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}-+$", RegexOptions.Compiled),
+                new Regex($@"^=+{anyWhitespace}第{numberPattern}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}=+$", RegexOptions.Compiled),
 
-        // 5. 支持纯符号包裹的无"第"字章节
-        new Regex($@"^#+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}#+$", RegexOptions.Compiled),
-        new Regex($@"^\*+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}\*+$", RegexOptions.Compiled),
-        new Regex($@"^-+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}-+$", RegexOptions.Compiled),
-        new Regex($@"^=+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}=+$", RegexOptions.Compiled),
+                // 5. 支持纯符号包裹的无"第"字章节
+                new Regex($@"^#+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}#+$", RegexOptions.Compiled),
+                new Regex($@"^\*+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}\*+$", RegexOptions.Compiled),
+                new Regex($@"^-+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}-+$", RegexOptions.Compiled),
+                new Regex($@"^=+{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}{anyWhitespace}=+$", RegexOptions.Compiled),
 
-        // 6. 英文章节
-        new Regex($@"^Chapter{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
-        new Regex($@"^Part{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
-        new Regex($@"^Section{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+                // 6. 英文章节
+                new Regex($@"^Chapter{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+                new Regex($@"^Part{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+                new Regex($@"^Section{anyWhitespace}{arabicNum}{anyWhitespace}{optionalTitle}$", RegexOptions.IgnoreCase | RegexOptions.Compiled),
 
-        // 7. 中文数字章节（无"第"字）
-        new Regex($@"^{chineseNum}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
-        
-        // 8. 纯数字章节
-        new Regex($@"^{arabicNum}{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
-        new Regex($@"^{arabicNum}{anyWhitespace}\.{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled)
-    };
+                // 7. 中文数字章节（无"第"字）
+                new Regex($@"^{chineseNum}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
+            
+                // 8. 纯数字章节
+                new Regex($@"^{arabicNum}{anyWhitespace}{keywordPattern}{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled),
+                new Regex($@"^{arabicNum}{anyWhitespace}\.{anyWhitespace}{optionalTitle}$", RegexOptions.Compiled)
+            };
 
             return patterns;
         }
-
-
 
         private string GetPreviewText(string[] lines, int currentIndex, int linesCount)
         {

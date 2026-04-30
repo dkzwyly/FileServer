@@ -26,6 +26,7 @@ builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
 builder.Services.AddScoped<IFileConflictService, FileConflictService>();
 builder.Services.AddScoped<IAudioMetadataService, AudioMetadataService>();
 builder.Services.AddScoped<IPhotoMetadataService, PhotoMetadataService>();
+builder.Services.AddMemoryCache();
 // 新增：注册 PhotoMetadataHostedService 作为后台服务
 builder.Services.AddHostedService<PhotoMetadataHostedService>();
 

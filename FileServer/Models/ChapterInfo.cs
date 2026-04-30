@@ -1,11 +1,9 @@
-﻿// 在 Models 文件夹下添加 ChapterInfo.cs
-namespace FileServer.Models
+﻿namespace FileServer.Models
 {
     public class ChapterInfo
     {
         public string Title { get; set; } = string.Empty;
-        public int Page { get; set; }
-        public int LineNumber { get; set; }
+        public int StartCharOffset { get; set; }   // 章节标题在全文中的起始字符索引
         public string Preview { get; set; } = string.Empty;
     }
 
