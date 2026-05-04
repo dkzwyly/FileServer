@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using System.Threading.Tasks;
 using FileServer.Models;
 
@@ -7,7 +8,7 @@ namespace FileServer.Services
     public interface IAudioMetadataService
     {
         /// <summary>
-        /// 获取歌曲元数据（优先返回映射，否则自动解析文件标签）
+        /// 获取歌曲元数据（优先返回映射，否则自动解析文件标签，并持久化缓存）
         /// </summary>
         Task<SongMetadata> GetMetadataAsync(string filePath);
 
@@ -40,5 +41,12 @@ namespace FileServer.Services
         /// 删除整个元数据映射（包括自定义封面文件）
         /// </summary>
         Task<bool> DeleteMetadataMappingAsync(string songPath);
+
+        /// <summary>
+        /// 全量扫描指定目录下的所有音频文件，提前提取元数据并持久化
+        /// </summary>
+        /// <param name="musicDirectory">音乐文件根目录</param>
+        /// <param name="progress">可选的进度报告器</param>
+        Task ScanAndIndexAllAsync(string musicDirectory, IProgress<string>? progress = null);
     }
 }

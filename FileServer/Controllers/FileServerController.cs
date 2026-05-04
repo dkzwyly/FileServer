@@ -2052,7 +2052,46 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取元数据失败", message = ex.Message });
             }
         }
+        [HttpPost("song/metadata/reindex")]
+        public IActionResult ReindexAllSongs()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
 
+                // 音乐文件存放的根目录（根据你的实际路径调整）
+                var musicRoot = Path.Combine(_fileService.GetRootPath(), "data", "音乐");
+
+                // 后台异步执行，不阻塞 HTTP 请求
+                _ = Task.Run(async () =>
+                {
+                    var progress = new Progress<string>(msg => _logger.LogInformation(msg));
+                    await _audioMetadataService.ScanAndIndexAllAsync(musicRoot, progress);
+                });
+
+                return Accepted(new
+                {
+                    message = "音频元数据全量索引已启动，请查看服务器日志了解进度"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "启动音频全量索引失败");
+                return StatusCode(500, new { error = "启动索引任务失败", message = ex.Message });
+            }
+        }
+        [HttpPost("song/metadata/batch")]
+        public async Task<IActionResult> GetBatchSongMetadata([FromBody] List<string> paths)
+        {
+            var result = new Dictionary<string, SongMetadata>();
+            foreach (var rawPath in paths)
+            {
+                var path = WebUtility.UrlDecode(rawPath);
+                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+                result[rawPath] = await _audioMetadataService.GetMetadataAsync(fullPath);
+            }
+            return Ok(result);
+        }
         [HttpPost("song/metadata/mapping")]
         public async Task<IActionResult> SaveSongMetadataMapping([FromBody] SaveMetadataMappingRequest request)
         {
