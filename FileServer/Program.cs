@@ -4,35 +4,33 @@ using FileServer.Middleware;
 using System.Security.Cryptography.X509Certificates;
 using System.Diagnostics;
 
-
 var builder = WebApplication.CreateBuilder(args);
 
 // 1. 配置绑定 - 使用 FileServerConfig 节点
 builder.Services.Configure<FileServerConfig>(
-    builder.Configuration.GetSection("FileServerConfig")); // 注意这里是 FileServerConfig
+    builder.Configuration.GetSection("FileServerConfig"));
 
-// 2. 注册 ThumbnailService 具体类（FileService 需要）
-builder.Services.AddScoped<ThumbnailService>(); // 关键：注册具体类
-
-// 3. 注册 ThumbnailService 接口指向具体类
-builder.Services.AddScoped<IThumbnailService>(provider =>
+// 2. 注册 ThumbnailService 具体类（改为 Singleton）
+builder.Services.AddSingleton<ThumbnailService>();
+// 3. 注册 ThumbnailService 接口指向具体类（Singleton）
+builder.Services.AddSingleton<IThumbnailService>(provider =>
     provider.GetRequiredService<ThumbnailService>());
 
-// 4. 注册其他服务
-builder.Services.AddScoped<IServerStatusService, ServerStatusService>();
-builder.Services.AddScoped<IFileService, FileService>();
-builder.Services.AddScoped<IMemoryMappedFileService, MemoryMappedFileService>();
-builder.Services.AddScoped<IChapterIndexService, ChapterIndexService>();
-builder.Services.AddScoped<IFileConflictService, FileConflictService>();
-builder.Services.AddScoped<IAudioMetadataService, AudioMetadataService>();
-builder.Services.AddScoped<IPhotoMetadataService, PhotoMetadataService>();
-builder.Services.AddMemoryCache();
-// 新增：注册 PhotoMetadataHostedService 作为后台服务
+// 4. 注册其他服务（统一改为 Singleton，避免生命周期冲突）
+builder.Services.AddSingleton<IServerStatusService, ServerStatusService>();
+builder.Services.AddSingleton<IFileService, FileService>();
+builder.Services.AddSingleton<IMemoryMappedFileService, MemoryMappedFileService>();
+builder.Services.AddSingleton<IChapterIndexService, ChapterIndexService>();
+builder.Services.AddSingleton<IFileConflictService, FileConflictService>();
+builder.Services.AddSingleton<IAudioMetadataService, AudioMetadataService>();
+builder.Services.AddSingleton<IPhotoMetadataService, PhotoMetadataService>();
+builder.Services.AddMemoryCache();  // MemoryCache 是单例模式，无需修改
+
+// 后台服务（HostedService 生命周期由主机管理，保持不变）
 builder.Services.AddHostedService<PhotoMetadataHostedService>();
-// 在已有 builder.Services 部分添加
 builder.Services.AddHostedService<AudioMetadataHostedService>();
 
-// 5. VideoThumbnailService
+// 5. VideoThumbnailService（已是 Singleton）
 builder.Services.AddSingleton<VideoThumbnailService>();
 builder.Services.AddSingleton<IHostedService>(provider =>
     provider.GetRequiredService<VideoThumbnailService>());
@@ -41,7 +39,6 @@ builder.Services.AddSingleton<IVideoThumbnailService>(provider =>
 
 // 6. 添加控制器
 builder.Services.AddControllers();
-
 
 // 创建并信任开发者证书
 var certificate = CreateAndTrustDeveloperCertificate();
@@ -53,7 +50,7 @@ if (certificate != null)
 // 配置 HTTP3/QUIC
 builder.WebHost.ConfigureKestrel((context, options) =>
 {
-    var config = context.Configuration.GetSection("FileServer").Get<FileServerConfig>();
+    var config = context.Configuration.GetSection("FileServerConfig").Get<FileServerConfig>();
 
     // HTTP 端点
     options.ListenAnyIP(config?.HttpPort ?? 8080);
@@ -144,9 +141,9 @@ app.MapGet("/health", async context =>
 });
 
 Console.WriteLine("🚀 文件服务器启动成功!");
-Console.WriteLine($"🌐 HTTP 访问: http://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpPort", 8080)}");
-Console.WriteLine($"🔒 HTTPS 访问: https://localhost:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
-Console.WriteLine($"📡 内网访问: https://{GetLocalIPAddress()}:{builder.Configuration.GetValue<int>("FileServer:HttpsPort", 8081)}");
+Console.WriteLine($"🌐 HTTP 访问: http://localhost:{builder.Configuration.GetValue<int>("FileServerConfig:HttpPort", 8080)}");
+Console.WriteLine($"🔒 HTTPS 访问: https://localhost:{builder.Configuration.GetValue<int>("FileServerConfig:HttpsPort", 8081)}");
+Console.WriteLine($"📡 内网访问: https://{GetLocalIPAddress()}:{builder.Configuration.GetValue<int>("FileServerConfig:HttpsPort", 8081)}");
 
 app.Run();
 

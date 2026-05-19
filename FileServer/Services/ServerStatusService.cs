@@ -20,7 +20,7 @@ namespace FileServer.Services
 
         public ServerStatusService(IConfiguration configuration)
         {
-            var config = configuration.GetSection("FileServer").Get<FileServerConfig>();
+            var config = configuration.GetSection("FileServerConfig").Get<FileServerConfig>();
             if (config != null)
             {
                 _status.RootPath = config.RootPath;

@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Options;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 
@@ -17,27 +18,41 @@ namespace FileServer.Services
         private readonly ILogger<MemoryMappedFileService> _logger;
         private readonly ConcurrentDictionary<string, (MemoryMappedFile MappedFile, DateTime LastAccess)> _cache;
         private readonly Timer _cleanupTimer;
-        private readonly long _maxCacheSize = 10L * 1024 * 1024 * 1024; // 10GB 最大缓存
-        private readonly TimeSpan _cacheTimeout = TimeSpan.FromMinutes(30); // 30分钟缓存
+        private readonly long _maxCacheSize = 10L * 1024 * 1024 * 1024; // 10GB
+        private readonly TimeSpan _cacheTimeout = TimeSpan.FromMinutes(30);
 
         public MemoryMappedFileService(IConfiguration configuration, ILogger<MemoryMappedFileService> logger)
         {
-            _rootPath = configuration["FileServer:RootPath"] ?? @"D:\FileServer";
+            // 修改点：使用正确的配置节点名，并移除硬编码默认值
+            _rootPath = configuration["FileServerConfig:RootPath"]
+                ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath，请检查 appsettings.json");
+
             _logger = logger;
             _cache = new ConcurrentDictionary<string, (MemoryMappedFile, DateTime)>();
-
-            // 每5分钟清理一次过期缓存
             _cleanupTimer = new Timer(CleanupCache, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+
+            _logger.LogInformation("MemoryMappedFileService 初始化，根路径: {RootPath}", _rootPath);
         }
+
+        // 可选：使用强类型配置，注入 IOptions<FileServerConfig>
+        // public MemoryMappedFileService(IOptions<FileServerConfig> options, ILogger<MemoryMappedFileService> logger)
+        // {
+        //     _rootPath = options.Value.RootPath;
+        //     ...
+        // }
 
         public async Task<(MemoryMappedFile MappedFile, string ContentType)> OpenMemoryMappedFile(string filePath)
         {
             try
             {
                 var physicalPath = Path.Combine(_rootPath, filePath);
+                _logger.LogDebug("尝试打开内存映射文件，物理路径: {PhysicalPath}", physicalPath);
 
                 if (!File.Exists(physicalPath))
+                {
+                    _logger.LogError("文件不存在: {FilePath} -> {PhysicalPath}", filePath, physicalPath);
                     throw new FileNotFoundException($"文件不存在: {filePath}");
+                }
 
                 // 检查缓存
                 if (_cache.TryGetValue(physicalPath, out var cached) &&
@@ -47,8 +62,8 @@ namespace FileServer.Services
                     _logger.LogDebug("从缓存获取内存映射文件: {FilePath}", filePath);
 
                     var extension = Path.GetExtension(filePath).ToLowerInvariant();
-                    var cachedContentType = GetMimeType(extension); // 重命名变量
-                    return (cached.MappedFile, cachedContentType);
+                    var contentType = GetMimeType(extension);
+                    return (cached.MappedFile, contentType);
                 }
 
                 // 创建新的内存映射
@@ -59,7 +74,7 @@ namespace FileServer.Services
                 _cache[physicalPath] = (mappedFile, DateTime.UtcNow);
 
                 var ext = Path.GetExtension(filePath).ToLowerInvariant();
-                var newContentType = GetMimeType(ext); // 重命名变量
+                var newContentType = GetMimeType(ext);
 
                 _logger.LogInformation("创建内存映射文件: {FilePath} (大小: {Size})",
                     filePath, FormatFileSize(fileInfo.Length));
@@ -86,15 +101,14 @@ namespace FileServer.Services
             {
                 try
                 {
-                    // 使用文件流创建内存映射文件，支持只读访问
                     var fileStream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
                     return MemoryMappedFile.CreateFromFile(
                         fileStream,
-                        null, // 不指定映射名称
+                        null,
                         fileSize,
                         MemoryMappedFileAccess.Read,
                         HandleInheritability.None,
-                        false // 不保留文件流
+                        false
                     );
                 }
                 catch (Exception ex)
@@ -124,16 +138,12 @@ namespace FileServer.Services
                 var now = DateTime.UtcNow;
                 var expiredKeys = new List<string>();
 
-                // 找出过期的缓存项
                 foreach (var kvp in _cache)
                 {
                     if (now - kvp.Value.LastAccess > _cacheTimeout)
-                    {
                         expiredKeys.Add(kvp.Key);
-                    }
                 }
 
-                // 移除过期缓存
                 foreach (var key in expiredKeys)
                 {
                     if (_cache.TryRemove(key, out var cached))
@@ -143,11 +153,10 @@ namespace FileServer.Services
                     }
                 }
 
-                // 如果缓存仍然过大，清理最久未使用的
                 if (GetCacheSize() > _maxCacheSize)
                 {
                     var oldestEntries = _cache.OrderBy(x => x.Value.LastAccess)
-                                            .Take(_cache.Count / 4) // 清理25%的最旧条目
+                                            .Take(_cache.Count / 4)
                                             .ToList();
 
                     foreach (var entry in oldestEntries)
@@ -175,19 +184,13 @@ namespace FileServer.Services
                 {
                     var fileInfo = new FileInfo(kvp.Key);
                     if (fileInfo.Exists)
-                    {
                         totalSize += fileInfo.Length;
-                    }
                 }
-                catch
-                {
-                    // 忽略无法访问的文件
-                }
+                catch { }
             }
             return totalSize;
         }
 
-        // 添加 MIME 类型检测方法
         private string GetMimeType(string extension)
         {
             var mimeTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -236,17 +239,12 @@ namespace FileServer.Services
                 { ".config", "text/xml" },
                 { ".sql", "application/sql" }
             };
-
-            return mimeTypes.TryGetValue(extension, out string mimeType)
-                ? mimeType
-                : "application/octet-stream";
+            return mimeTypes.TryGetValue(extension, out var mime) ? mime : "application/octet-stream";
         }
 
-        // 添加文件大小格式化方法
         private string FormatFileSize(long bytes)
         {
             if (bytes == 0) return "0 B";
-
             string[] sizes = { "B", "KB", "MB", "GB", "TB" };
             int order = 0;
             double len = bytes;
@@ -261,14 +259,11 @@ namespace FileServer.Services
         public void Dispose()
         {
             _cleanupTimer?.Dispose();
-
-            // 清理所有缓存
             foreach (var kvp in _cache)
             {
                 kvp.Value.MappedFile?.Dispose();
             }
             _cache.Clear();
-
             GC.SuppressFinalize(this);
         }
     }

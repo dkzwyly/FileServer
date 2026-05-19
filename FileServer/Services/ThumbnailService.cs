@@ -1,22 +1,28 @@
-﻿using FileServer.Models;
-using SixLabors.ImageSharp;
+﻿using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Gif;
 using SixLabors.ImageSharp.Processing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace FileServer.Services
 {
     public class ThumbnailService : IThumbnailService
     {
+        private readonly string _rootPath;
         private readonly string _thumbnailsRoot;
         private readonly ILogger<ThumbnailService> _logger;
 
         public ThumbnailService(IConfiguration configuration, ILogger<ThumbnailService> logger)
         {
-            var fileServerRoot = configuration["FileServer:RootPath"] ?? @"D:\FileServer";
-            _thumbnailsRoot = Path.Combine(fileServerRoot, ".thumbnails");
+            // 使用正确的配置节点
+            _rootPath = configuration["FileServerConfig:RootPath"]
+                ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
+
+            var thumbnailDir = configuration["FileServerConfig:ThumbnailDirectory"] ?? "_thumbnails";
+            _thumbnailsRoot = Path.Combine(_rootPath, thumbnailDir);
             _logger = logger;
 
             EnsureThumbnailDirectory();
@@ -40,7 +46,6 @@ namespace FileServer.Services
                         _logger.LogWarning(ex, "无法设置缩略图目录为隐藏属性");
                     }
                 }
-
                 _logger.LogInformation("创建缩略图目录: {ThumbnailsRoot}", _thumbnailsRoot);
             }
         }
@@ -55,7 +60,8 @@ namespace FileServer.Services
                     return false;
                 }
 
-                var fullImagePath = Path.GetFullPath(Path.Combine(_thumbnailsRoot, "..", imagePath));
+                // 修正：直接使用根路径 + 相对路径
+                var fullImagePath = Path.Combine(_rootPath, imagePath);
                 if (!File.Exists(fullImagePath))
                 {
                     _logger.LogWarning("原图片不存在: {ImagePath}", fullImagePath);
@@ -70,17 +76,12 @@ namespace FileServer.Services
 
                 var thumbnailPath = await GetThumbnailPathAsync(imagePath);
                 var thumbnailDir = Path.GetDirectoryName(thumbnailPath);
-
                 if (!Directory.Exists(thumbnailDir))
-                {
                     Directory.CreateDirectory(thumbnailDir);
-                }
 
                 var extension = Path.GetExtension(fullImagePath).ToLowerInvariant();
-
                 _logger.LogInformation("生成缩略图: {ImagePath} -> {ThumbnailPath}", imagePath, thumbnailPath);
 
-                // 根据文件类型使用不同的编码器
                 IImageEncoder encoder;
                 if (extension == ".gif")
                 {
@@ -93,12 +94,10 @@ namespace FileServer.Services
                 }
                 else if (extension == ".webp")
                 {
-                    // WebP保持原格式
                     encoder = new SixLabors.ImageSharp.Formats.Webp.WebpEncoder();
                 }
                 else
                 {
-                    // 其他格式（jpg, jpeg, bmp）使用JPG
                     encoder = new JpegEncoder { Quality = 80 };
                 }
 
@@ -109,7 +108,6 @@ namespace FileServer.Services
                         Size = new Size(width, height),
                         Mode = ResizeMode.Max
                     }));
-
                     await image.SaveAsync(thumbnailPath, encoder);
                 }
 
@@ -128,28 +126,16 @@ namespace FileServer.Services
             try
             {
                 _logger.LogInformation("处理GIF文件: {GifPath}", gifPath);
-
-                // 对于GIF文件，我们只提取第一帧作为缩略图
                 using (var image = await Image.LoadAsync(gifPath))
                 {
-                    // 如果是多帧GIF，只取第一帧
-                    if (image.Frames.Count > 1)
-                    {
-                        _logger.LogInformation("GIF包含 {FrameCount} 帧，使用第一帧", image.Frames.Count);
-                    }
-
                     image.Mutate(x => x.Resize(new ResizeOptions
                     {
                         Size = new Size(width, height),
                         Mode = ResizeMode.Max
                     }));
-
-                    // GIF缩略图保存为PNG格式以保持透明度
                     var encoder = new PngEncoder();
                     await image.SaveAsync(thumbnailPath.Replace(".jpg", ".png"), encoder);
-
-                    _logger.LogInformation("GIF缩略图生成成功: {ThumbnailPath}",
-                        Path.GetFileName(thumbnailPath));
+                    _logger.LogInformation("GIF缩略图生成成功: {ThumbnailPath}", Path.GetFileName(thumbnailPath));
                 }
             }
             catch (Exception ex)
@@ -172,7 +158,6 @@ namespace FileServer.Services
                 var thumbnailPath = await GetThumbnailPathAsync(imagePath);
                 var extension = Path.GetExtension(imagePath).ToLowerInvariant();
 
-                // 对于GIF文件，缩略图可能是.png格式
                 if (extension == ".gif")
                 {
                     var pngThumbnailPath = thumbnailPath.Replace(".jpg", ".png");
@@ -199,24 +184,19 @@ namespace FileServer.Services
             }
         }
 
-        public Task<string> GetThumbnailPathAsync(string imagePath)
+        public async Task<string> GetThumbnailPathAsync(string imagePath)
         {
             var normalizedPath = imagePath.Replace('\\', '/').TrimStart('/');
             var hash = ComputeMD5Hash(normalizedPath);
-
             var subDir1 = hash.Substring(0, 2);
             var subDir2 = hash.Substring(2, 2);
             var thumbnailDir = Path.Combine(_thumbnailsRoot, subDir1, subDir2);
 
             if (!Directory.Exists(thumbnailDir))
-            {
                 Directory.CreateDirectory(thumbnailDir);
-            }
 
             var thumbnailName = $"{hash}.jpg";
-            var thumbnailPath = Path.Combine(thumbnailDir, thumbnailName);
-
-            return Task.FromResult(thumbnailPath);
+            return Path.Combine(thumbnailDir, thumbnailName);
         }
 
         public async Task<bool> ThumbnailExistsAsync(string imagePath)
@@ -226,13 +206,11 @@ namespace FileServer.Services
                 var thumbnailPath = await GetThumbnailPathAsync(imagePath);
                 var extension = Path.GetExtension(imagePath).ToLowerInvariant();
 
-                // 对于GIF文件，检查.png缩略图
                 if (extension == ".gif")
                 {
                     var pngThumbnailPath = thumbnailPath.Replace(".jpg", ".png");
                     return File.Exists(pngThumbnailPath);
                 }
-
                 return File.Exists(thumbnailPath);
             }
             catch (Exception ex)
@@ -249,20 +227,16 @@ namespace FileServer.Services
                 var thumbnailPath = await GetThumbnailPathAsync(imagePath);
                 var extension = Path.GetExtension(imagePath).ToLowerInvariant();
 
-                // 对于GIF文件，使用.png缩略图
                 if (extension == ".gif")
                 {
                     var pngThumbnailPath = thumbnailPath.Replace(".jpg", ".png");
                     if (File.Exists(pngThumbnailPath))
-                    {
                         return new FileStream(pngThumbnailPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                    }
                 }
 
                 if (File.Exists(thumbnailPath))
-                {
                     return new FileStream(thumbnailPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                }
+
                 throw new FileNotFoundException("缩略图不存在");
             }
             catch (Exception ex)
@@ -276,10 +250,7 @@ namespace FileServer.Services
         {
             var fullPath = Path.GetFullPath(path);
             var thumbnailsFullPath = Path.GetFullPath(_thumbnailsRoot);
-
-            return fullPath.StartsWith(thumbnailsFullPath, StringComparison.OrdinalIgnoreCase) ||
-                   path.Contains(".thumbnails", StringComparison.OrdinalIgnoreCase) ||
-                   path.Contains("_thumbnails", StringComparison.OrdinalIgnoreCase);
+            return fullPath.StartsWith(thumbnailsFullPath, StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsSupportedImageFormat(string filePath)

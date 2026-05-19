@@ -31,7 +31,8 @@ namespace FileServer.Services
                    ThumbnailService thumbnailService,
                    IFileConflictService conflictService)  
         {
-            _rootPath = configuration["FileServer:RootPath"] ?? @"D:\FileServer";
+            _rootPath = configuration["FileServerConfig:RootPath"]
+    ?? throw new InvalidOperationException("配置缺少 FileServerConfig:RootPath");
             _logger = logger;
             _thumbnailService = thumbnailService;
             _conflictService = conflictService; 

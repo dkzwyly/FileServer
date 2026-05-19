@@ -38,7 +38,8 @@ namespace FileServer.Services
             if (string.IsNullOrEmpty(_rootPath))
             {
                 _rootPath = fileService.GetRootPath();
-                _metadataFilePath = Path.Combine(_rootPath, ".metadata", "photos.json");
+                var metadataDir = configuration.GetValue<string>("FileServerConfig:MetadataDirectory") ?? ".metadata";
+                _metadataFilePath = Path.Combine(_rootPath, metadataDir, "photos.json");
                 var dir = Path.GetDirectoryName(_metadataFilePath);
                 if (!string.IsNullOrEmpty(dir))
                     System.IO.Directory.CreateDirectory(dir);

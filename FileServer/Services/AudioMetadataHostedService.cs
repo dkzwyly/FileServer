@@ -25,7 +25,10 @@ public class AudioMetadataHostedService : IHostedService
             var audioService = scope.ServiceProvider.GetRequiredService<IAudioMetadataService>();
             var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
             var rootPath = config.GetValue<string>("FileServerConfig:RootPath")!;
-            var musicRoot = Path.Combine(rootPath, "data", "音乐");
+            var audioDir = config.GetValue<string>("FileServerConfig:AudioIndexDirectory");
+            if (string.IsNullOrEmpty(audioDir))
+                throw new InvalidOperationException("配置缺少 FileServerConfig:AudioIndexDirectory");
+            var musicRoot = Path.Combine(rootPath, audioDir);
             await audioService.ScanAndIndexAllAsync(musicRoot);
             _logger.LogInformation("音乐元数据索引任务完成");
         }

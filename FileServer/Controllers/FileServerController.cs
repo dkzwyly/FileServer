@@ -1873,10 +1873,13 @@ namespace FileServer.Controllers
         {
             try
             {
-                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+                var mappingFilePath = GetLyricsMappingFilePath();
+                var dir = Path.GetDirectoryName(mappingFilePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 Dictionary<string, string> mappings = new Dictionary<string, string>();
 
-                // 读取现有的映射文件
                 if (System.IO.File.Exists(mappingFilePath))
                 {
                     var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
@@ -1884,10 +1887,8 @@ namespace FileServer.Controllers
                               ?? new Dictionary<string, string>();
                 }
 
-                // 添加或更新映射
                 mappings[request.SongPath] = request.LyricsPath;
 
-                // 保存回文件
                 var newJson = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
                 {
                     WriteIndented = true
@@ -1908,20 +1909,16 @@ namespace FileServer.Controllers
         {
             try
             {
-                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+                var mappingFilePath = GetLyricsMappingFilePath();
 
                 if (!System.IO.File.Exists(mappingFilePath))
-                {
                     return null;
-                }
 
                 var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
                 var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
 
                 if (mappings != null && mappings.TryGetValue(songPath, out var lyricsPath))
-                {
                     return lyricsPath;
-                }
 
                 return null;
             }
@@ -1936,12 +1933,10 @@ namespace FileServer.Controllers
         {
             try
             {
-                var mappingFilePath = Path.Combine(_fileService.GetRootPath(), "lyrics-mappings.json");
+                var mappingFilePath = GetLyricsMappingFilePath();
 
                 if (!System.IO.File.Exists(mappingFilePath))
-                {
                     return false;
-                }
 
                 var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
                 var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
@@ -2247,7 +2242,14 @@ namespace FileServer.Controllers
 
         #endregion
 
-
+        private string GetLyricsMappingFilePath()
+        {
+            var rootPath = _fileService.GetRootPath();
+            var lyricsMappingFile = _configuration.GetValue<string>("FileServerConfig:LyricsMappingFile");
+            if (string.IsNullOrEmpty(lyricsMappingFile))
+                lyricsMappingFile = "lyrics-mappings.json";
+            return Path.Combine(rootPath, lyricsMappingFile);
+        }
         private string FormatUptime(long uptimeInMilliseconds)
         {
             var uptime = TimeSpan.FromMilliseconds(uptimeInMilliseconds);
@@ -2297,13 +2299,5 @@ namespace FileServer.Controllers
         }
 
         #endregion
-    }
-
-    public static class FileServiceExtensions
-    {
-        public static string GetRootPath(this IFileService fileService)
-        {
-            return @"E:\FileServer";
-        }
     }
 }

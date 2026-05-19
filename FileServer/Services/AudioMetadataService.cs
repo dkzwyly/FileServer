@@ -30,21 +30,33 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     public AudioMetadataService(ILogger<AudioMetadataService> logger, IConfiguration configuration)
     {
         _logger = logger;
-        var rootPath = configuration.GetValue<string>("FileServerConfig:RootPath") ?? @"D:\FileServer";
-        _mappingFilePath = Path.Combine(rootPath, "song-metadata-mappings.json");
-        _coversDirectory = Path.Combine(rootPath, "covers");
+        var rootPath = configuration["FileServerConfig:RootPath"]
+            ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
 
+        // 封面目录（可配置）
+        var coversDir = configuration["FileServerConfig:CoversDirectory"];
+        if (string.IsNullOrEmpty(coversDir))
+            coversDir = "covers";
+        _coversDirectory = Path.Combine(rootPath, coversDir);
+
+        // 歌曲元数据映射文件路径（可配置）
+        var mappingFile = configuration["FileServerConfig:SongMetadataMappingFile"];
+        if (string.IsNullOrEmpty(mappingFile))
+            mappingFile = "song-metadata-mappings.json";
+        _mappingFilePath = Path.Combine(rootPath, mappingFile);
+
+        // 确保封面目录存在
         if (!Directory.Exists(_coversDirectory))
             Directory.CreateDirectory(_coversDirectory);
 
-        // 静态路径只初始化一次
+        // 静态路径只初始化一次（供定时器和静态方法使用）
         if (string.IsNullOrEmpty(_mappingFilePathStatic))
-        {
             _mappingFilePathStatic = _mappingFilePath;
-            LoadFromFile(); // 从 JSON 加载已有数据到内存
-        }
 
-        // 初始化静态定时器（仅创建一次）
+        // 加载已有数据
+        LoadFromFile();
+
+        // 初始化自动保存定时器（全局一次）
         if (_autoSaveTimer == null)
         {
             lock (_timerInitLock)
@@ -62,7 +74,7 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     // ---------- 静态方法：文件持久化 ----------
     private static void LoadFromFile()
     {
-        if (!System.IO.File.Exists(_mappingFilePathStatic))
+        if (string.IsNullOrEmpty(_mappingFilePathStatic) || !System.IO.File.Exists(_mappingFilePathStatic))
             return;
 
         _fileLock.Wait();
@@ -88,6 +100,9 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 
     private static async Task SaveToFileAsync()
     {
+        if (string.IsNullOrEmpty(_mappingFilePathStatic))
+            return;
+
         await _fileLock.WaitAsync();
         try
         {
