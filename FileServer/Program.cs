@@ -25,6 +25,7 @@ builder.Services.AddSingleton<IFileConflictService, FileConflictService>();
 builder.Services.AddSingleton<IAudioMetadataService, AudioMetadataService>();
 builder.Services.AddSingleton<IPhotoMetadataService, PhotoMetadataService>();
 builder.Services.AddMemoryCache();  // MemoryCache 是单例模式，无需修改
+builder.Services.AddSingleton<ILyricsMappingService, LyricsMappingService>();
 
 
 // 后台服务（HostedService 生命周期由主机管理，保持不变）

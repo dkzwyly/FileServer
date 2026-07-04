@@ -32,12 +32,16 @@ namespace FileServer.Services
             _logger = logger;
             _configuration = configuration;
 
-            _rootPath = fileService.GetRootPath();
+            // 从 fileService 获取根路径并转换为绝对路径
+            var rawRoot = fileService.GetRootPath();
+            _rootPath = Path.GetFullPath(rawRoot);
 
             // LiteDB 数据库（使用独立配置键 PhotoLiteDbPath）
             var dbPath = configuration["FileServerConfig:PhotoLiteDbPath"];
             if (string.IsNullOrEmpty(dbPath))
                 dbPath = Path.Combine(_rootPath, "photo-metadata.db");
+            else
+                dbPath = Path.GetFullPath(Path.Combine(_rootPath, dbPath));
 
             // 确保数据库文件所在目录存在（使用 Dir 别名）
             var dbDir = Path.GetDirectoryName(dbPath);
@@ -52,7 +56,7 @@ namespace FileServer.Services
             _collection.EnsureIndex(x => x.Longitude);
 
             LoadFromDatabase();
-            _logger.LogInformation("PhotoMetadataService 初始化完成，已加载 {Count} 条元数据", _cache.Count);
+            _logger.LogInformation("PhotoMetadataService 初始化完成，数据库路径: {DbPath}", dbPath);
         }
 
         private void LoadFromDatabase()

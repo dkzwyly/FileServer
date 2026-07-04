@@ -9,8 +9,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using TagLib;
 using FileServer.Models;
-
-// 消除歧义别名
 using SystemFile = System.IO.File;
 using TagFile = TagLib.File;
 
@@ -22,28 +20,30 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     private readonly string _coversDirectory;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<SongMetadata> _collection;
-
     private static readonly ConcurrentDictionary<string, SongMetadata> _cache = new();
 
     public AudioMetadataService(ILogger<AudioMetadataService> logger, IConfiguration configuration)
     {
         _logger = logger;
 
+        // 读取根路径并转换为绝对路径
         var rootPath = configuration["FileServerConfig:RootPath"]
             ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
+        rootPath = Path.GetFullPath(rootPath);
 
         // 封面目录
-        var coversDir = configuration["FileServerConfig:CoversDirectory"] ?? "covers";
+        var coversDir = configuration["FileServerConfig:CoversDirectory"] ?? "系统文件/covers";
         _coversDirectory = Path.Combine(rootPath, coversDir);
         if (!Directory.Exists(_coversDirectory))
             Directory.CreateDirectory(_coversDirectory);
 
-        // LiteDB 数据库（使用独立配置键 AudioLiteDbPath）
+        // 数据库路径（优先使用绝对路径配置，否则基于 RootPath 组合）
         var dbPath = configuration["FileServerConfig:AudioLiteDbPath"];
         if (string.IsNullOrEmpty(dbPath))
             dbPath = Path.Combine(rootPath, "audio-metadata.db");
+        else
+            dbPath = Path.GetFullPath(Path.Combine(rootPath, dbPath));
 
-        // 确保数据库文件所在目录存在
         var dbDir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dbDir) && !Directory.Exists(dbDir))
             Directory.CreateDirectory(dbDir);
@@ -53,10 +53,9 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         _collection.EnsureIndex(x => x.FilePath, unique: true);
 
         LoadFromDatabase();
-        _logger.LogInformation("AudioMetadataService 初始化完成，已加载 {Count} 条元数据", _cache.Count);
+        _logger.LogInformation("AudioMetadataService 初始化完成，数据库路径: {DbPath}", dbPath);
     }
 
-    // ---------- 数据库加载 ----------
     private void LoadFromDatabase()
     {
         try
@@ -71,7 +70,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         }
     }
 
-    // ---------- 私有辅助：保存/删除 ----------
     private void SaveToDatabase(SongMetadata metadata)
     {
         try
@@ -96,8 +94,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             _logger.LogError(ex, "从 LiteDB 删除失败: {FilePath}", filePath);
         }
     }
-
-    // ---------- 公共接口 ----------
 
     public async Task<SongMetadata> GetMetadataAsync(string filePath)
     {
@@ -279,7 +275,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         }
     }
 
-    // ---------- 增量索引 ----------
     public async Task ScanAndIndexAllAsync(string musicDirectory, IProgress<string>? progress = null)
     {
         if (!Directory.Exists(musicDirectory))
@@ -294,7 +289,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             ".mp3", ".flac", ".wav", ".m4a", ".ogg", ".wma", ".aac", ".ape", ".wv", ".opus"
         };
 
-        // 1. 扫描磁盘文件（仅获取路径、修改时间、大小，不解码）
         var diskFiles = Directory.GetFiles(musicDirectory, "*.*", SearchOption.AllDirectories)
                                  .Where(f => audioExtensions.Contains(Path.GetExtension(f)))
                                  .Select(f => new
@@ -308,10 +302,8 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         progress?.Report($"扫描到 {diskFiles.Count} 个音频文件，正在与数据库比对...");
         _logger.LogInformation("增量索引：磁盘文件数 {Count}", diskFiles.Count);
 
-        // 2. 加载数据库现有记录（字典）
         var dbRecords = _collection.FindAll().ToDictionary(m => m.FilePath);
 
-        // 3. 分类变化
         var toAdd = new List<string>();
         var toUpdate = new List<string>();
         var toDelete = new List<string>();
@@ -320,10 +312,8 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         {
             if (dbRecords.TryGetValue(diskFile.Path, out var existing))
             {
-                // 比较最后修改时间，也可同时比较 Size 以提高可靠性
                 if (existing.LastModified != diskFile.LastWrite)
                     toUpdate.Add(diskFile.Path);
-                // 无变化则忽略
             }
             else
             {
@@ -348,7 +338,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 
         progress?.Report($"检测到变化：新增 {toAdd.Count}，更新 {toUpdate.Count}，删除 {toDelete.Count}");
 
-        // 4. 处理删除
         foreach (var path in toDelete)
         {
             if (_cache.TryRemove(path, out var removed))
@@ -363,7 +352,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             }
         }
 
-        // 5. 处理新增和更新（解码元数据）
         var toProcess = toAdd.Concat(toUpdate).ToList();
         int processed = 0;
         foreach (var path in toProcess)
@@ -384,8 +372,6 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         progress?.Report($"增量索引完成，成功处理 {processed}/{toProcess.Count} 个变化文件");
         _logger.LogInformation("增量索引完成，处理了 {Processed} 个文件，删除了 {Deleted} 个", processed, toDelete.Count);
     }
-
-    // ---------- 私有辅助 ----------
 
     private async Task<SongMetadata> ExtractAndCacheAsync(string filePath)
     {
@@ -438,6 +424,59 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             CustomCoverPath = null,
             LastModified = null
         };
+    }
+    /// <summary>
+    /// 批量获取元数据，优先从内存缓存返回，其次从 LiteDB 读取，避免逐文件磁盘检查。
+    /// </summary>
+    public async Task<Dictionary<string, SongMetadata>> GetBatchMetadataAsync(List<string> paths)
+    {
+        var result = new Dictionary<string, SongMetadata>();
+        var missingPaths = new List<string>();
+
+        // 1. 从内存缓存获取
+        foreach (var path in paths)
+        {
+            if (_cache.TryGetValue(path, out var cached))
+            {
+                result[path] = cached;
+            }
+            else
+            {
+                missingPaths.Add(path);
+            }
+        }
+
+        // 2. 从 LiteDB 批量获取缺失的
+        if (missingPaths.Any())
+        {
+            // 使用 LiteDB 的 Contains 查询（或构建 Filter.In）
+            // 替换原有的 LINQ Contains
+            var bsonValues = missingPaths.Select(p => new BsonValue(p)).ToList();
+            var bsonArray = new BsonArray(bsonValues);
+            var dbResults = _collection.Find(Query.In("FilePath", bsonArray)).ToList();
+            foreach (var meta in dbResults)
+            {
+                _cache.TryAdd(meta.FilePath, meta);
+                result[meta.FilePath] = meta;
+                missingPaths.Remove(meta.FilePath);
+            }
+        }
+
+        // 3. 对仍缺失的路径，提取并缓存（极少情况）
+        foreach (var path in missingPaths)
+        {
+            try
+            {
+                var meta = await ExtractAndCacheAsync(path);
+                result[path] = meta;
+            }
+            catch
+            {
+                result[path] = FallbackMetadata(path);
+            }
+        }
+
+        return result;
     }
 
     public void Dispose()

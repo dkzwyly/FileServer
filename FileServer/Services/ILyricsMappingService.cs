@@ -3,7 +3,7 @@
 namespace FileServer.Services
 {
     /// <summary>
-    /// 歌词映射服务（存储歌曲路径 ↔ 歌词文件路径）
+    /// 歌词映射服务（存储歌曲路径 ↔ 歌词文件路径 / "NO_LYRICS" 标记）
     /// </summary>
     public interface ILyricsMappingService
     {

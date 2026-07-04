@@ -169,6 +169,13 @@ public class VideoThumbnailService : IVideoThumbnailService, IHostedService
             return;
         }
 
+        // 如果缩略图已存在，不入队
+        if (ThumbnailExists(videoPath))
+        {
+            _logger.LogDebug("缩略图已存在，跳过入队: {VideoPath}", videoPath);
+            return;
+        }
+
         if (!_workersStarted)
         {
             _logger.LogWarning("工作线程未启动，立即启动");
@@ -225,6 +232,7 @@ public class VideoThumbnailService : IVideoThumbnailService, IHostedService
             int queuedCount = 0;
             foreach (var videoFile in videoFiles)
             {
+                // 检查缩略图是否存在，不存在才入队
                 if (!ThumbnailExists(videoFile))
                 {
                     QueueVideoForGeneration(videoFile);
@@ -344,7 +352,8 @@ public class VideoThumbnailService : IVideoThumbnailService, IHostedService
                 };
             }
 
-            if (File.Exists(thumbnailPath) && IsThumbnailUpToDate(request.VideoPath, thumbnailPath))
+            // 只检查文件是否存在，不检查时间戳
+            if (File.Exists(thumbnailPath))
             {
                 return new VideoThumbnailResponse
                 {
@@ -529,7 +538,8 @@ public class VideoThumbnailService : IVideoThumbnailService, IHostedService
             var thumbnailPath = GetThumbnailFilePath(request);
             if (string.IsNullOrEmpty(thumbnailPath)) return false;
 
-            return File.Exists(thumbnailPath) && IsThumbnailUpToDate(videoPath, thumbnailPath);
+            // 只检查文件是否存在
+            return File.Exists(thumbnailPath);
         }
         catch (Exception ex)
         {
@@ -753,20 +763,6 @@ public class VideoThumbnailService : IVideoThumbnailService, IHostedService
         {
             _logger.LogError(ex, "获取缩略图文件路径失败");
             return Path.Combine(Path.GetTempPath(), "thumbnails", $"default_{Guid.NewGuid()}.jpg");
-        }
-    }
-
-    private bool IsThumbnailUpToDate(string videoPath, string thumbnailPath)
-    {
-        try
-        {
-            var videoFile = new FileInfo(Path.Combine(_fileService.GetRootPath(), videoPath));
-            var thumbnailFile = new FileInfo(thumbnailPath);
-            return thumbnailFile.Exists && videoFile.Exists && thumbnailFile.LastWriteTime >= videoFile.LastWriteTime;
-        }
-        catch
-        {
-            return false;
         }
     }
 

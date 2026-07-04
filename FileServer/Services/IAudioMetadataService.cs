@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using FileServer.Models;
@@ -11,6 +12,11 @@ namespace FileServer.Services
         /// 获取歌曲元数据（优先返回映射，否则自动解析文件标签，并持久化缓存）
         /// </summary>
         Task<SongMetadata> GetMetadataAsync(string filePath);
+
+        /// <summary>
+        /// 批量获取歌曲元数据（优先从内存/数据库，不做文件时间戳检查，速度极快）
+        /// </summary>
+        Task<Dictionary<string, SongMetadata>> GetBatchMetadataAsync(List<string> paths);
 
         /// <summary>
         /// 保存元数据映射（标题、艺术家、专辑）

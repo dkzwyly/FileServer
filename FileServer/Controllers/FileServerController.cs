@@ -23,6 +23,7 @@ namespace FileServer.Controllers
         private readonly IPhotoMetadataService _photoMetadataService;
         private readonly int _charactersPerPage;
         private readonly IMemoryCache _memoryCache;
+        private readonly ILyricsMappingService _lyricsMappingService;
 
         public FileServerController(IFileService fileService,
                                   IServerStatusService statusService,
@@ -33,7 +34,8 @@ namespace FileServer.Controllers
                                   IVideoThumbnailService videoThumbnailService,
                                   IAudioMetadataService audioMetadataService,
                                   IMemoryCache memoryCache,
-                                  IPhotoMetadataService photoMetadataService)
+                                  IPhotoMetadataService photoMetadataService,
+                                  ILyricsMappingService lyricsMappingService)
         {
             _fileService = fileService;
             _statusService = statusService;
@@ -42,6 +44,7 @@ namespace FileServer.Controllers
             _memoryMappedService = memoryMappedService;
             _chapterIndexService = chapterIndexService;
             _videoThumbnailService = videoThumbnailService;
+            _lyricsMappingService = lyricsMappingService;
             _audioMetadataService = audioMetadataService;
             _photoMetadataService = photoMetadataService;
             _charactersPerPage = configuration.GetValue<int>("Preview:CharactersPerPage", 5000);
@@ -1390,6 +1393,94 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "获取视频信息失败", message = ex.Message });
             }
         }
+        /// <summary>
+        /// 获取完整的影视库目录树（两层结构）
+        /// </summary>
+        [HttpGet("video-library")]
+        public async Task<IActionResult> GetVideoLibrary()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                var root = await BuildVideoLibraryTree();
+                return Ok(root);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取影视库失败");
+                return StatusCode(500, new { error = "获取影视库失败", message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// 构建影视库树（仅两层：根 → 季/视频文件夹 → 视频文件）
+        /// </summary>
+        private async Task<VideoLibraryNode> BuildVideoLibraryTree()
+        {
+            // 1. 获取根目录 data/影视
+            var rootResponse = await _fileService.GetFileListAsync("data/影视");
+            var rootNode = new VideoLibraryNode
+            {
+                Name = "影视",
+                Path = "data/影视",
+                Type = "root",
+                Children = new List<VideoLibraryNode>()
+            };
+
+            // 2. 遍历第一层目录（季文件夹 或 直接包含视频的文件夹）
+            foreach (var dir in rootResponse.Directories)
+            {
+                var seasonNode = new VideoLibraryNode
+                {
+                    Name = dir.Name,
+                    Path = dir.Path,
+                    Type = "season",
+                    Children = new List<VideoLibraryNode>()
+                };
+
+                // 3. 获取该目录下的文件列表（第二层）
+                var subResponse = await _fileService.GetFileListAsync(dir.Path);
+
+                foreach (var file in subResponse.Files)
+                {
+                    if (file.IsVideo)
+                    {
+                        seasonNode.Children.Add(new VideoLibraryNode
+                        {
+                            Name = file.Name,
+                            Path = file.Path,
+                            Size = file.Size,
+                            SizeFormatted = file.SizeFormatted,
+                            Type = "video",
+                            Children = null
+                        });
+                    }
+                }
+
+                // 如果该文件夹内至少有一个视频，或者想要保留空文件夹也可以
+                // 此处保留所有第一层文件夹（即使没有视频也不影响）
+                rootNode.Children.Add(seasonNode);
+            }
+
+            // 4. 根目录下直接存在的视频文件（如果存在）
+            foreach (var file in rootResponse.Files)
+            {
+                if (file.IsVideo)
+                {
+                    rootNode.Children.Add(new VideoLibraryNode
+                    {
+                        Name = file.Name,
+                        Path = file.Path,
+                        Size = file.Size,
+                        SizeFormatted = file.SizeFormatted,
+                        Type = "video",
+                        Children = null
+                    });
+                }
+            }
+
+            return rootNode;
+        }
         [HttpPost("photo-metadata/batch")]
         public async Task<IActionResult> GetBatchPhotoMetadata([FromBody] List<string> paths)
         {
@@ -1415,63 +1506,37 @@ namespace FileServer.Controllers
                 _statusService.IncrementRequests();
 
                 if (string.IsNullOrEmpty(request.SongPath))
-                {
                     return BadRequest(new { error = "歌曲路径不能为空" });
-                }
 
-                // URL 解码路径
                 request.SongPath = WebUtility.UrlDecode(request.SongPath);
                 request.LyricsPath = WebUtility.UrlDecode(request.LyricsPath);
 
                 _logger.LogInformation("保存歌词映射 - 歌曲: {SongPath}, 歌词: {LyricsPath}",
                     request.SongPath, request.LyricsPath);
 
-                // 检查歌曲文件是否存在
                 if (!await _fileService.FileExistsAsync(request.SongPath))
-                {
                     return NotFound(new { error = "歌曲文件不存在" });
-                }
 
-                // 特殊处理：标记为无歌词
                 if (request.LyricsPath == "NO_LYRICS")
                 {
-                    // 保存无歌词标记
-                    var result = await SaveLyricsMappingToFile(request);
-
+                    var result = await _lyricsMappingService.SaveMappingAsync(request.SongPath, "NO_LYRICS");
                     if (result)
-                    {
-                        _logger.LogInformation("标记歌曲为无歌词: {SongPath}", request.SongPath);
                         return Ok(new { success = true, message = "歌曲已标记为无歌词" });
-                    }
                     else
-                    {
                         return StatusCode(500, new { error = "标记无歌词失败" });
-                    }
                 }
 
-                // 正常歌词文件映射
                 if (string.IsNullOrEmpty(request.LyricsPath))
-                {
                     return BadRequest(new { error = "歌词路径不能为空" });
-                }
 
-                // 检查歌词文件是否存在
                 if (!await _fileService.FileExistsAsync(request.LyricsPath))
-                {
                     return NotFound(new { error = "歌词文件不存在" });
-                }
 
-                // 保存映射到数据库或文件
-                var saveResult = await SaveLyricsMappingToFile(request);
-
+                var saveResult = await _lyricsMappingService.SaveMappingAsync(request.SongPath, request.LyricsPath);
                 if (saveResult)
-                {
                     return Ok(new { success = true, message = "歌词映射保存成功" });
-                }
                 else
-                {
                     return StatusCode(500, new { error = "保存歌词映射失败" });
-                }
             }
             catch (Exception ex)
             {
@@ -1491,19 +1556,14 @@ namespace FileServer.Controllers
                 _logger.LogInformation("获取歌词 - 歌曲路径: {SongPath}", songPath);
 
                 // 1. 首先查找映射的歌词文件
-                var mappedLyricsPath = await GetMappedLyricsPath(songPath);
+                var mappedLyricsPath = await _lyricsMappingService.GetMappingAsync(songPath);
 
                 if (!string.IsNullOrEmpty(mappedLyricsPath))
                 {
-                    // 检查是否为无歌词标记
                     if (mappedLyricsPath == "NO_LYRICS")
                     {
                         _logger.LogInformation("歌曲标记为无歌词: {SongPath}", songPath);
-                        return Ok(new
-                        {
-                            type = "no_lyrics",
-                            message = "此歌曲已标记为无歌词"
-                        });
+                        return Ok(new { type = "no_lyrics", message = "此歌曲已标记为无歌词" });
                     }
 
                     _logger.LogInformation("找到映射的歌词文件: {LyricsPath}", mappedLyricsPath);
@@ -1513,18 +1573,12 @@ namespace FileServer.Controllers
                 // 2. 如果没有映射，尝试智能匹配
                 var directory = Path.GetDirectoryName(songPath);
                 var fileName = Path.GetFileNameWithoutExtension(songPath);
-
-                // 智能匹配查找最佳匹配（无论置信度如何，只要有匹配就返回）
                 var bestLyricsMatch = await FindBestLyricsMatch(songPath, fileName, directory);
 
                 if (bestLyricsMatch != null && bestLyricsMatch.LyricsFile != null)
                 {
-                    // 找到匹配，自动保存映射
-                    await SaveLyricsMappingToFile(new LyricsMappingRequest
-                    {
-                        SongPath = songPath,
-                        LyricsPath = bestLyricsMatch.LyricsFile.Path
-                    });
+                    // 找到匹配，自动保存映射（使用服务）
+                    await _lyricsMappingService.SaveMappingAsync(songPath, bestLyricsMatch.LyricsFile.Path);
 
                     _logger.LogInformation("智能匹配成功并建立映射: {SongPath} -> {LyricsPath}, 分数: {Score}",
                         songPath, bestLyricsMatch.LyricsFile.Path, bestLyricsMatch.MatchScore);
@@ -1532,7 +1586,7 @@ namespace FileServer.Controllers
                     return await GetLyricsContent(bestLyricsMatch.LyricsFile.Path);
                 }
 
-                // 3. 如果智能匹配失败（没有找到任何匹配），尝试在同目录下查找同名的.lrc文件
+                // 3. 如果智能匹配失败，尝试同目录下同名 .lrc
                 var possibleLyricsPath = Path.Combine(directory, fileName + ".lrc");
                 if (await _fileService.FileExistsAsync(possibleLyricsPath))
                 {
@@ -1856,11 +1910,10 @@ namespace FileServer.Controllers
                 songPath = WebUtility.UrlDecode(songPath);
                 _logger.LogInformation("获取歌词映射: {SongPath}", songPath);
 
-                var mappedLyricsPath = await GetMappedLyricsPath(songPath);
+                var mappedLyricsPath = await _lyricsMappingService.GetMappingAsync(songPath);
 
                 if (!string.IsNullOrEmpty(mappedLyricsPath))
                 {
-                    // 处理无歌词标记
                     if (mappedLyricsPath == "NO_LYRICS")
                     {
                         return Ok(new
@@ -1902,16 +1955,12 @@ namespace FileServer.Controllers
                 songPath = WebUtility.UrlDecode(songPath);
                 _logger.LogInformation("删除歌词映射: {SongPath}", songPath);
 
-                var result = await DeleteLyricsMappingFromFile(songPath);
+                var result = await _lyricsMappingService.DeleteMappingAsync(songPath);
 
                 if (result)
-                {
                     return Ok(new { success = true, message = "歌词映射删除成功" });
-                }
                 else
-                {
                     return NotFound(new { error = "未找到歌词映射" });
-                }
             }
             catch (Exception ex)
             {
@@ -1924,96 +1973,7 @@ namespace FileServer.Controllers
 
         #region 私有方法 - 歌词功能
 
-        private async Task<bool> SaveLyricsMappingToFile(LyricsMappingRequest request)
-        {
-            try
-            {
-                var mappingFilePath = GetLyricsMappingFilePath();
-                var dir = Path.GetDirectoryName(mappingFilePath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-
-                Dictionary<string, string> mappings = new Dictionary<string, string>();
-
-                if (System.IO.File.Exists(mappingFilePath))
-                {
-                    var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
-                    mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json)
-                              ?? new Dictionary<string, string>();
-                }
-
-                mappings[request.SongPath] = request.LyricsPath;
-
-                var newJson = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
-                {
-                    WriteIndented = true
-                });
-                await System.IO.File.WriteAllTextAsync(mappingFilePath, newJson);
-
-                _logger.LogInformation("歌词映射保存成功: {SongPath} -> {LyricsPath}", request.SongPath, request.LyricsPath);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "保存歌词映射到文件失败");
-                return false;
-            }
-        }
-
-        private async Task<string> GetMappedLyricsPath(string songPath)
-        {
-            try
-            {
-                var mappingFilePath = GetLyricsMappingFilePath();
-
-                if (!System.IO.File.Exists(mappingFilePath))
-                    return null;
-
-                var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
-                var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
-
-                if (mappings != null && mappings.TryGetValue(songPath, out var lyricsPath))
-                    return lyricsPath;
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "获取映射歌词路径失败");
-                return null;
-            }
-        }
-
-        private async Task<bool> DeleteLyricsMappingFromFile(string songPath)
-        {
-            try
-            {
-                var mappingFilePath = GetLyricsMappingFilePath();
-
-                if (!System.IO.File.Exists(mappingFilePath))
-                    return false;
-
-                var json = await System.IO.File.ReadAllTextAsync(mappingFilePath);
-                var mappings = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
-
-                if (mappings != null && mappings.Remove(songPath))
-                {
-                    var newJson = System.Text.Json.JsonSerializer.Serialize(mappings, new System.Text.Json.JsonSerializerOptions
-                    {
-                        WriteIndented = true
-                    });
-                    await System.IO.File.WriteAllTextAsync(mappingFilePath, newJson);
-                    return true;
-                }
-
-                return false;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "删除歌词映射失败");
-                return false;
-            }
-        }
+        
 
         private async Task<IActionResult> GetLyricsContent(string lyricsPath)
         {
@@ -2133,14 +2093,40 @@ namespace FileServer.Controllers
         [HttpPost("song/metadata/batch")]
         public async Task<IActionResult> GetBatchSongMetadata([FromBody] List<string> paths)
         {
-            var result = new Dictionary<string, SongMetadata>();
-            foreach (var rawPath in paths)
+            // 把传入的路径全部解码，并生成完整的物理路径
+            var decodedPaths = paths.Select(raw =>
             {
-                var path = WebUtility.UrlDecode(rawPath);
-                var fullPath = Path.Combine(_fileService.GetRootPath(), path);
-                result[rawPath] = await _audioMetadataService.GetMetadataAsync(fullPath);
+                var decoded = WebUtility.UrlDecode(raw);
+                return new
+                {
+                    Original = raw,
+                    FullPath = Path.Combine(_fileService.GetRootPath(), decoded)
+                };
+            }).ToList();
+
+            // 调用你服务里已有的批量方法，只传全路径列表
+            var fullPathList = decodedPaths.Select(x => x.FullPath).ToList();
+            var batchResult = await _audioMetadataService.GetBatchMetadataAsync(fullPathList);
+
+            // 组装返回结果，保持 key 为原始的编码路径
+            var response = new Dictionary<string, SongMetadata>();
+            foreach (var item in decodedPaths)
+            {
+                // 批量结果里 key 是全路径，映射回原始请求 key
+                if (batchResult.TryGetValue(item.FullPath, out var meta))
+                    response[item.Original] = meta;
+                else
+                    // 理论上不会走到这里，但如果真的没有，给一个降级元数据
+                    response[item.Original] = new SongMetadata
+                    {
+                        FilePath = item.FullPath,
+                        Title = Path.GetFileNameWithoutExtension(item.FullPath),
+                        Artist = "未知艺术家",
+                        Album = "未知专辑"
+                    };
             }
-            return Ok(result);
+
+            return Ok(response);
         }
         [HttpPost("song/metadata/mapping")]
         public async Task<IActionResult> SaveSongMetadataMapping([FromBody] SaveMetadataMappingRequest request)
@@ -2297,14 +2283,7 @@ namespace FileServer.Controllers
 
         #endregion
 
-        private string GetLyricsMappingFilePath()
-        {
-            var rootPath = _fileService.GetRootPath();
-            var lyricsMappingFile = _configuration.GetValue<string>("FileServerConfig:LyricsMappingFile");
-            if (string.IsNullOrEmpty(lyricsMappingFile))
-                lyricsMappingFile = "lyrics-mappings.json";
-            return Path.Combine(rootPath, lyricsMappingFile);
-        }
+       
         private string FormatUptime(long uptimeInMilliseconds)
         {
             var uptime = TimeSpan.FromMilliseconds(uptimeInMilliseconds);

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Threading.Tasks;
 using LiteDB;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -16,12 +17,15 @@ namespace FileServer.Services
         {
             _logger = logger;
 
-            // 复用与音频元数据相同的数据库配置，保证同一文件
             var rootPath = configuration["FileServerConfig:RootPath"]
                 ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
-            var dbPath = configuration["FileServerConfig:AudioLiteDbPath"];
+            rootPath = Path.GetFullPath(rootPath);
+
+            var dbPath = configuration["FileServerConfig:LyricsLiteDbPath"];
             if (string.IsNullOrEmpty(dbPath))
-                dbPath = Path.Combine(rootPath, "audio-metadata.db");
+                dbPath = Path.Combine(rootPath, "lyrics-mappings.db");
+            else
+                dbPath = Path.GetFullPath(Path.Combine(rootPath, dbPath));
 
             var dbDir = Path.GetDirectoryName(dbPath);
             if (!string.IsNullOrEmpty(dbDir) && !Directory.Exists(dbDir))
@@ -30,6 +34,8 @@ namespace FileServer.Services
             _db = new LiteDatabase(dbPath);
             _collection = _db.GetCollection<LyricsMappingRecord>("lyricsMappings");
             _collection.EnsureIndex(x => x.FilePath, unique: true);
+
+            _logger.LogInformation("LyricsMappingService 初始化完成，数据库路径: {DbPath}", dbPath);
         }
 
         public async Task<bool> SaveMappingAsync(string songPath, string lyricsPath)
@@ -87,7 +93,6 @@ namespace FileServer.Services
             _db?.Dispose();
         }
 
-        // 内部实体类
         private class LyricsMappingRecord
         {
             [BsonId]

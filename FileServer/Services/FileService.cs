@@ -1,5 +1,7 @@
 ﻿using FileServer.Models;
 using System.Text;
+using System.Text.Json;
+using System.Collections.Concurrent;
 
 namespace FileServer.Services
 {
@@ -26,23 +28,310 @@ namespace FileServer.Services
         private readonly ILogger<FileService> _logger;
         private readonly IFileConflictService _conflictService;
 
+        // ---------- 视频缓存相关 ----------
+        private readonly ConcurrentDictionary<string, VideoCacheEntry> _videoCache = new();
+        private readonly string _videoCacheFilePath;
+        private readonly object _videoCacheLock = new();
+        private bool _videoCacheLoaded = false;
+
+        private class VideoCacheEntry
+        {
+            public FileListResponse Response { get; set; } = null!;
+            public DateTime LastWriteTimeUtc { get; set; }
+        }
+
         public FileService(IConfiguration configuration,
                    ILogger<FileService> logger,
                    ThumbnailService thumbnailService,
-                   IFileConflictService conflictService)  
+                   IFileConflictService conflictService)
         {
             _rootPath = configuration["FileServerConfig:RootPath"]
-    ?? throw new InvalidOperationException("配置缺少 FileServerConfig:RootPath");
+                ?? throw new InvalidOperationException("配置缺少 FileServerConfig:RootPath");
+            _rootPath = Path.GetFullPath(_rootPath);
+
             _logger = logger;
             _thumbnailService = thumbnailService;
-            _conflictService = conflictService; 
+            _conflictService = conflictService;
 
             if (!Directory.Exists(_rootPath))
             {
                 Directory.CreateDirectory(_rootPath);
                 _logger.LogInformation("创建根目录: {RootPath}", _rootPath);
             }
+
+            // 初始化视频缓存文件路径（仍保留，但不强制依赖磁盘文件）
+            var cacheDir = configuration["FileServerConfig:MetadataDirectory"] ?? "系统文件";
+            var fullCacheDir = Path.Combine(_rootPath, cacheDir);
+            if (!Directory.Exists(fullCacheDir))
+                Directory.CreateDirectory(fullCacheDir);
+            _videoCacheFilePath = Path.Combine(fullCacheDir, "video_cache.json");
+
+            // ===== 新增：启动时同步预加载视频目录缓存 =====
+            try
+            {
+                PreloadVideoCache().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "启动预加载视频缓存失败，将在首次请求时按需扫描");
+            }
         }
+
+        // ==================== 视频缓存方法 ====================
+        /// <summary>
+        /// 启动时预加载 video 目录下所有子目录的文件列表缓存
+        /// </summary>
+        private async Task PreloadVideoCache()
+        {
+            var videoRoot = Path.Combine(_rootPath, "data", "影视");
+            if (!Directory.Exists(videoRoot))
+            {
+                _logger.LogWarning("视频根目录不存在，跳过预加载: {Path}", videoRoot);
+                return;
+            }
+
+            // 获取所有子目录（包括深层目录）
+            var directories = Directory.GetDirectories(videoRoot, "*", SearchOption.AllDirectories);
+
+            _logger.LogInformation("开始预加载视频目录缓存，共 {Count} 个目录", directories.Length);
+
+            int loadedCount = 0;
+            foreach (var dir in directories)
+            {
+                try
+                {
+                    var relativePath = Path.GetRelativePath(_rootPath, dir).Replace('\\', '/');
+                    var response = await BuildFileListResponse(relativePath);
+
+                    _videoCache[relativePath] = new VideoCacheEntry
+                    {
+                        Response = response,
+                        LastWriteTimeUtc = Directory.GetLastWriteTimeUtc(dir)
+                    };
+
+                    loadedCount++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "预加载目录失败，跳过: {Dir}", dir);
+                }
+            }
+
+            _logger.LogInformation("预加载完成，成功缓存 {Loaded}/{Total} 个视频目录",
+                loadedCount, directories.Length);
+        }
+
+        private void LoadVideoCache()
+        {
+            try
+            {
+                if (File.Exists(_videoCacheFilePath))
+                {
+                    var json = File.ReadAllText(_videoCacheFilePath);
+                    var options = new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true,
+                        IncludeFields = true
+                    };
+                    var cacheData = JsonSerializer.Deserialize<Dictionary<string, VideoCacheEntry>>(json, options);
+                    if (cacheData != null)
+                    {
+                        foreach (var kv in cacheData)
+                            _videoCache.TryAdd(kv.Key, kv.Value);
+                        _logger.LogInformation("从磁盘加载视频缓存，共 {Count} 个条目", _videoCache.Count);
+                    }
+                }
+                _videoCacheLoaded = true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "加载视频缓存失败，将在首次访问时重新扫描");
+                if (File.Exists(_videoCacheFilePath))
+                {
+                    try { File.Delete(_videoCacheFilePath); } catch { }
+                }
+                _videoCacheLoaded = false;
+            }
+        }
+
+        private void SaveVideoCache()
+        {
+            try
+            {
+                var cacheData = _videoCache.ToDictionary(
+                    kv => kv.Key,
+                    kv => new
+                    {
+                        // 这里需要 CachedResponse 属性，如果你未修改 VideoCacheEntry，
+                        // 可以暂时注释掉 SaveVideoCache 的调用，或者只序列化部分字段
+                        kv.Value.Response,
+                        kv.Value.LastWriteTimeUtc
+                    }
+                );
+
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                var json = JsonSerializer.Serialize(cacheData, options);
+
+                var tempFile = _videoCacheFilePath + ".tmp";
+                File.WriteAllText(tempFile, json);
+                File.Move(tempFile, _videoCacheFilePath, true);
+
+                _logger.LogInformation("✅ 视频缓存已保存");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ 保存视频缓存失败（不影响正常运行）");
+                // 不要 throw
+            }
+        }
+
+        // ==================== 公共方法 ====================
+
+        public async Task<FileListResponse> GetFileListAsync(string relativePath)
+        {
+            var normalized = relativePath?.Replace('\\', '/').Trim('/') ?? "";
+            _logger.LogInformation("GetFileListAsync 原始路径: {Raw}, 规范化后: {Normalized}", relativePath, normalized);
+
+            // 视频目录专用缓存逻辑
+            if (normalized.StartsWith("data/影视", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("★★★ 进入视频缓存分支 ★★★ 路径: {Path}", normalized);
+
+                // 1. 尝试从内存缓存直接返回
+                if (_videoCache.TryGetValue(normalized, out var cachedEntry))
+                {
+                    _logger.LogInformation("📀 从启动缓存直接返回（无IO）: {Path}", normalized);
+                    return cachedEntry.Response;
+                }
+
+                // 2. 缓存未命中（可能是启动后新增的目录），执行扫描并加入缓存
+                _logger.LogInformation("⚠️ 缓存未命中，执行磁盘扫描并加入缓存: {Path}", normalized);
+                var physicalPath = Path.Combine(_rootPath, normalized);
+                if (!Directory.Exists(physicalPath))
+                {
+                    _logger.LogWarning("视频目录不存在: {Path}", physicalPath);
+                    throw new DirectoryNotFoundException($"目录不存在: {normalized}");
+                }
+
+                var response = await BuildFileListResponse(normalized);
+
+                var newEntry = new VideoCacheEntry
+                {
+                    Response = response,
+                    LastWriteTimeUtc = Directory.GetLastWriteTimeUtc(physicalPath)
+                };
+                _videoCache[normalized] = newEntry;
+
+                // 可选：将新增的缓存持久化到磁盘（如果你仍想保留磁盘缓存）
+                try
+                {
+                    SaveVideoCache();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "持久化新缓存失败，但不影响当前请求");
+                }
+
+                return response;
+            }
+            else
+            {
+                // 非视频目录，保持原有实时扫描逻辑
+                _logger.LogInformation("普通路径（非视频目录），实时扫描: {Path}", normalized);
+                return await BuildFileListResponse(normalized);
+            }
+        }
+
+        /// <summary>
+        /// 构建文件列表响应（不缓存，实时扫描）
+        /// </summary>
+        private async Task<FileListResponse> BuildFileListResponse(string normalizedPath)
+        {
+            var physicalPath = Path.Combine(_rootPath, normalizedPath);
+
+            if (!physicalPath.StartsWith(_rootPath))
+                physicalPath = _rootPath;
+
+            if (!Directory.Exists(physicalPath))
+                throw new DirectoryNotFoundException($"目录不存在: {normalizedPath}");
+
+            var response = new FileListResponse
+            {
+                CurrentPath = normalizedPath,
+                ParentPath = GetParentPath(normalizedPath)
+            };
+
+            try
+            {
+                var directories = await Task.Run(() => Directory.GetDirectories(physicalPath));
+                var files = await Task.Run(() => Directory.GetFiles(physicalPath));
+
+                foreach (var dir in directories)
+                {
+                    try
+                    {
+                        var dirInfo = new DirectoryInfo(dir);
+                        response.Directories.Add(new DirectoryInfoModel
+                        {
+                            Name = dirInfo.Name,
+                            Path = Path.Combine(normalizedPath, dirInfo.Name).Replace("\\", "/")
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "处理目录失败: {Directory}", dir);
+                    }
+                }
+
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var fileInfo = new FileInfo(file);
+                        var extension = Path.GetExtension(file).ToLowerInvariant();
+                        var relativeFilePath = Path.Combine(normalizedPath, fileInfo.Name).Replace("\\", "/");
+
+                        var fileModel = new FileInfoModel
+                        {
+                            Name = fileInfo.Name,
+                            Path = relativeFilePath,
+                            Size = fileInfo.Length,
+                            SizeFormatted = FormatFileSize(fileInfo.Length),
+                            Extension = extension,
+                            LastModified = fileInfo.LastWriteTime,
+                            IsVideo = IsVideoFile(extension),
+                            IsAudio = IsAudioFile(extension),
+                            MimeType = GetMimeType(extension),
+                            Encoding = IsTextFile(extension) ? "utf-8" : "",
+                            HasThumbnail = false
+                        };
+
+                        if (IsImageFile(extension))
+                        {
+                            fileModel.HasThumbnail = await _thumbnailService.ThumbnailExistsAsync(relativeFilePath);
+                        }
+
+                        response.Files.Add(fileModel);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "处理文件失败: {File}", file);
+                    }
+                }
+
+                _logger.LogInformation("返回目录列表: {Path} - {DirCount} 目录, {FileCount} 文件",
+                    normalizedPath, response.Directories.Count, response.Files.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "读取文件列表失败: {Path}", normalizedPath);
+                throw;
+            }
+
+            return response;
+        }
+
+        // ==================== 文件信息 ====================
 
         public async Task<FileInfoModel> GetFileInfoAsync(string filePath)
         {
@@ -74,94 +363,7 @@ namespace FileServer.Services
             });
         }
 
-        public async Task<FileListResponse> GetFileListAsync(string relativePath)
-        {
-            var physicalPath = Path.Combine(_rootPath, relativePath);
-
-            if (!physicalPath.StartsWith(_rootPath))
-            {
-                physicalPath = _rootPath;
-            }
-
-            if (!Directory.Exists(physicalPath))
-            {
-                throw new DirectoryNotFoundException($"目录不存在: {relativePath}");
-            }
-
-            var response = new FileListResponse
-            {
-                CurrentPath = relativePath,
-                ParentPath = GetParentPath(relativePath)
-            };
-
-            try
-            {
-                var directories = Directory.GetDirectories(physicalPath);
-                foreach (var dir in directories)
-                {
-                    try
-                    {
-                        var dirInfo = new DirectoryInfo(dir);
-                        response.Directories.Add(new DirectoryInfoModel
-                        {
-                            Name = dirInfo.Name,
-                            Path = Path.Combine(relativePath, dirInfo.Name).Replace("\\", "/")
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "处理目录失败: {Directory}", dir);
-                    }
-                }
-
-                var files = Directory.GetFiles(physicalPath);
-                foreach (var file in files)
-                {
-                    try
-                    {
-                        var fileInfo = new FileInfo(file);
-                        var extension = Path.GetExtension(file).ToLowerInvariant();
-                        var relativeFilePath = Path.Combine(relativePath, fileInfo.Name).Replace("\\", "/");
-
-                        var fileModel = new FileInfoModel
-                        {
-                            Name = fileInfo.Name,
-                            Path = relativeFilePath,
-                            Size = fileInfo.Length,
-                            SizeFormatted = FormatFileSize(fileInfo.Length),
-                            Extension = extension,
-                            LastModified = fileInfo.LastWriteTime,
-                            IsVideo = IsVideoFile(extension),
-                            IsAudio = IsAudioFile(extension),
-                            MimeType = GetMimeType(extension),
-                            Encoding = IsTextFile(extension) ? "utf-8" : "",
-                            HasThumbnail = false
-                        };
-
-                        if (IsImageFile(extension))
-                        {
-                            fileModel.HasThumbnail = await _thumbnailService.ThumbnailExistsAsync(relativeFilePath);
-                        }
-
-                        response.Files.Add(fileModel);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "处理文件失败: {File}", file);
-                    }
-                }
-
-                _logger.LogInformation("返回目录列表: {Path} - {DirCount} 目录, {FileCount} 文件",
-                    relativePath, response.Directories.Count, response.Files.Count);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "读取文件列表失败: {Path}", relativePath);
-                throw;
-            }
-
-            return response;
-        }
+        // ==================== 下载文件 ====================
 
         public async Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath)
         {
@@ -185,8 +387,10 @@ namespace FileServer.Services
 
             _logger.LogInformation("文件下载: {FileName} (大小: {Size})", fileInfo.Name, FormatFileSize(fileInfo.Length));
 
-            return (stream, contentType, fileInfo.Name);
+            return await Task.FromResult((stream, contentType, fileInfo.Name));
         }
+
+        // ==================== 上传文件 ====================
 
         public async Task<UploadResponse> UploadFilesAsync(string targetPath, IFormFileCollection files)
         {
@@ -218,7 +422,6 @@ namespace FileServer.Services
                     continue;
                 }
 
-                // 记录上传文件的详细信息
                 _logger.LogInformation("处理上传文件 - 原始文件名: {OriginalFileName}, " +
                                        "ContentType: {ContentType}, " +
                                        "大小: {Size}, " +
@@ -229,7 +432,7 @@ namespace FileServer.Services
                 var fileName = MakeValidFileName(file.FileName);
 
                 // 使用冲突服务获取唯一文件名
-                var originalFileNameForConflict = fileName; // 保存清理后的文件名
+                var originalFileNameForConflict = fileName;
                 fileName = await _conflictService.GenerateUniqueFileNameAsync(uploadPath, fileName);
 
                 var filePath = Path.Combine(uploadPath, fileName);
@@ -284,7 +487,6 @@ namespace FileServer.Services
 
                     totalSize += fileInfo.Length;
 
-                    // 添加上传文件信息
                     uploadedFiles.Add(new UploadedFileInfo
                     {
                         OriginalName = originalFileName,
@@ -322,7 +524,6 @@ namespace FileServer.Services
                     _logger.LogError(ex, "文件保存失败: {FileName}", fileName);
                     failedCount++;
 
-                    // 记录失败信息
                     uploadedFiles.Add(new UploadedFileInfo
                     {
                         OriginalName = originalFileName,
@@ -347,7 +548,6 @@ namespace FileServer.Services
                 _logger.LogWarning("没有文件成功上传");
             }
 
-            // 构建响应
             var response = new UploadResponse
             {
                 Success = uploadedFiles.Count - failedCount > 0,
@@ -363,17 +563,18 @@ namespace FileServer.Services
                 FailedUploads = failedCount
             };
 
-            // 为了向后兼容，保持原有的 Files 字段
+            // 向后兼容
             response.Files = uploadedFiles
                 .Where(f => string.IsNullOrEmpty(f.RenameReason) || !f.RenameReason.StartsWith("上传失败"))
                 .Select(f => f.SavedName)
                 .ToList();
 
-            // 计算格式化的大小
             response.CalculateFormattedSize();
 
             return response;
         }
+
+        // ==================== 文件验证辅助 ====================
 
         private async Task ValidateFileFormat(string filePath, string extension, string originalFileName)
         {
@@ -429,6 +630,8 @@ namespace FileServer.Services
             }
         }
 
+        // ==================== 删除文件 ====================
+
         public async Task<bool> DeleteFileAsync(string filePath)
         {
             try
@@ -457,6 +660,8 @@ namespace FileServer.Services
             }
         }
 
+        // ==================== 缩略图 ====================
+
         public async Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath)
         {
             var extension = Path.GetExtension(filePath).ToLowerInvariant();
@@ -469,11 +674,7 @@ namespace FileServer.Services
             return (stream, "image/jpeg", $"{Path.GetFileNameWithoutExtension(filePath)}_thumb.jpg");
         }
 
-        private bool IsImageFile(string extension)
-        {
-            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
-            return imageExtensions.Contains(extension.ToLowerInvariant());
-        }
+        // ==================== 其他基础方法 ====================
 
         public Task<bool> FileExistsAsync(string filePath)
         {
@@ -561,6 +762,8 @@ namespace FileServer.Services
             return _rootPath;
         }
 
+        // ==================== 私有辅助 ====================
+
         private string GetParentPath(string currentPath)
         {
             if (string.IsNullOrEmpty(currentPath))
@@ -595,6 +798,12 @@ namespace FileServer.Services
             return textExtensions.Contains(extension.ToLowerInvariant());
         }
 
+        private bool IsImageFile(string extension)
+        {
+            var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
+            return imageExtensions.Contains(extension.ToLowerInvariant());
+        }
+
         private string MakeValidFileName(string name)
         {
             try
@@ -608,7 +817,6 @@ namespace FileServer.Services
                     return guidName;
                 }
 
-                // 分离文件名和扩展名
                 var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(name);
                 var extension = Path.GetExtension(name);
 
@@ -622,13 +830,11 @@ namespace FileServer.Services
                         fileNameWithoutExtension);
                 }
 
-                // 记录原始文件名中的字符信息
                 _logger.LogDebug("原始文件名字符分析 - 长度: {Length}, 包含中文: {HasChinese}, 包含特殊字符: {HasSpecialChars}",
                     fileNameWithoutExtension.Length,
                     fileNameWithoutExtension.Any(c => c >= 0x4E00 && c <= 0x9FFF),
                     fileNameWithoutExtension.Any(c => Path.GetInvalidFileNameChars().Contains(c)));
 
-                // 只移除真正的非法字符，保留Unicode字符（中文等）
                 var invalidChars = Path.GetInvalidFileNameChars();
                 var validFileName = new string(fileNameWithoutExtension
                     .Where(ch => !invalidChars.Contains(ch))
@@ -637,7 +843,6 @@ namespace FileServer.Services
                 _logger.LogDebug("移除非法字符后 - 有效文件名部分: '{ValidFileName}', 原始长度: {OriginalLength}, 新长度: {NewLength}",
                     validFileName, fileNameWithoutExtension.Length, validFileName.Length);
 
-                // 如果移除后文件名为空，使用GUID
                 if (string.IsNullOrWhiteSpace(validFileName))
                 {
                     validFileName = $"upload_{Guid.NewGuid():N}";
@@ -645,7 +850,6 @@ namespace FileServer.Services
                         validFileName);
                 }
 
-                // 确保扩展名是有效的
                 var validExtension = string.IsNullOrEmpty(extension)
                     ? GetDefaultExtension(name)
                     : extension;
@@ -659,7 +863,6 @@ namespace FileServer.Services
             }
             catch (Exception ex)
             {
-                // 如果出错，返回一个安全的文件名
                 var guidName = $"upload_{Guid.NewGuid():N}{GetDefaultExtension(name)}";
                 _logger.LogError(ex, "处理文件名时发生异常，原始文件名: '{OriginalName}'，使用默认文件名: '{GuidName}'",
                     name, guidName);
@@ -674,7 +877,6 @@ namespace FileServer.Services
             {
                 return originalExtension;
             }
-
             return ".dat";
         }
     }
