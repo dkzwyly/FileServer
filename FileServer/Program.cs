@@ -26,6 +26,7 @@ builder.Services.AddSingleton<IAudioMetadataService, AudioMetadataService>();
 builder.Services.AddSingleton<IPhotoMetadataService, PhotoMetadataService>();
 builder.Services.AddMemoryCache();  // MemoryCache 是单例模式，无需修改
 
+
 // 后台服务（HostedService 生命周期由主机管理，保持不变）
 builder.Services.AddHostedService<PhotoMetadataHostedService>();
 builder.Services.AddHostedService<AudioMetadataHostedService>();

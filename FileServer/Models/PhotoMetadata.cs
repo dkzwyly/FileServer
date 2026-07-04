@@ -1,9 +1,11 @@
-﻿using Microsoft.AspNetCore.Mvc.Filters;
+﻿using LiteDB;
+using Microsoft.AspNetCore.Mvc.Filters;
 
 namespace FileServer.Models
 {
     public class PhotoMetadata
     {
+        [BsonId]
         public string RelativePath { get; set; } = string.Empty;
         public string FileName { get; set; } = string.Empty;
         public DateTime? DateTaken { get; set; }

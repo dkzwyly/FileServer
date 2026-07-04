@@ -1,6 +1,4 @@
-﻿using System;
-
-namespace FileServer.Models
+﻿namespace FileServer.Models
 {
     public class VideoThumbnailResponse
     {

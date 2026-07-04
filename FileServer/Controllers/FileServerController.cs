@@ -365,21 +365,46 @@ namespace FileServer.Controllers
 
                 var result = await _fileService.UploadFilesAsync(path, Request.Form.Files);
 
-                if (result.Success)
+                if (result.Success && result.UploadedFiles != null)
                 {
-                    // ========== 新增：增量更新照片元数据 ==========
-                    if (result.UploadedFiles != null)
+                    foreach (var uploadedFile in result.UploadedFiles.Where(f => f.Success))
                     {
-                        foreach (var uploadedFile in result.UploadedFiles.Where(f => f.Success))
+                        var extension = Path.GetExtension(uploadedFile.Path).ToLowerInvariant();
+
+                        // ----- 图片上传后更新照片元数据（异步，不阻塞） -----
+                        if (IsImageFile(extension))
                         {
-                            var extension = Path.GetExtension(uploadedFile.Path).ToLowerInvariant();
-                            if (IsImageFile(extension))
+                            _ = Task.Run(async () =>
                             {
-                                _ = _photoMetadataService.GetOrExtractMetadataAsync(uploadedFile.Path);
-                            }
+                                try
+                                {
+                                    await _photoMetadataService.GetOrExtractMetadataAsync(uploadedFile.Path);
+                                    _logger.LogInformation("图片元数据已提取: {Path}", uploadedFile.Path);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogError(ex, "提取图片元数据失败: {Path}", uploadedFile.Path);
+                                }
+                            });
+                        }
+                        // ----- 音频上传后更新音频元数据（异步） -----
+                        else if (IsAudioFile(extension))
+                        {
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    var fullPath = Path.Combine(_fileService.GetRootPath(), uploadedFile.Path);
+                                    await _audioMetadataService.GetMetadataAsync(fullPath);
+                                    _logger.LogInformation("音频元数据已提取: {Path}", uploadedFile.Path);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogError(ex, "提取音频元数据失败: {Path}", uploadedFile.Path);
+                                }
+                            });
                         }
                     }
-                    // ===============================================
                     return Ok(result);
                 }
                 else
@@ -506,6 +531,36 @@ namespace FileServer.Controllers
 
                 if (result)
                 {
+                    var extension = Path.GetExtension(path).ToLowerInvariant();
+
+                    // ----- 图片删除：清理元数据 -----
+                    if (IsImageFile(extension))
+                    {
+                        try
+                        {
+                            await _photoMetadataService.DeleteMetadataAsync(path);
+                            _logger.LogInformation("图片元数据已删除: {Path}", path);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "删除图片元数据失败: {Path}", path);
+                        }
+                    }
+                    // ----- 音频删除：清理元数据 -----
+                    else if (IsAudioFile(extension))
+                    {
+                        try
+                        {
+                            var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+                            await _audioMetadataService.DeleteMetadataMappingAsync(fullPath);
+                            _logger.LogInformation("音频元数据已删除: {Path}", path);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "删除音频元数据失败: {Path}", path);
+                        }
+                    }
+
                     return Ok(new { success = true, message = "文件删除成功" });
                 }
                 else
@@ -2297,7 +2352,11 @@ namespace FileServer.Controllers
             var imageExtensions = new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" };
             return imageExtensions.Contains(extension.ToLowerInvariant());
         }
-
+        private bool IsAudioFile(string extension)
+        {
+            var audioExtensions = new[] { ".mp3", ".flac", ".wav", ".m4a", ".ogg", ".wma", ".aac", ".ape", ".wv", ".opus" };
+            return audioExtensions.Contains(extension.ToLowerInvariant());
+        }
         #endregion
     }
 }

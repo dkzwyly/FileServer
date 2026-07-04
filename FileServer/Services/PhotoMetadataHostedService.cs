@@ -15,20 +15,26 @@ namespace FileServer.Services
             _logger = logger;
         }
 
-        public async Task StartAsync(CancellationToken cancellationToken)
+        public Task StartAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("PhotoMetadataHostedService 启动，开始触发图片索引...");
-            try
+            _logger.LogInformation("PhotoMetadataHostedService 启动，将在后台触发图片增量索引...");
+
+            _ = Task.Run(async () =>
             {
-                using var scope = _scopeFactory.CreateScope();
-                var photoService = scope.ServiceProvider.GetRequiredService<IPhotoMetadataService>();
-                await photoService.ScanConfiguredDirectoriesAsync();
-                _logger.LogInformation("图片索引任务完成");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "PhotoMetadataHostedService 执行失败");
-            }
+                try
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var photoService = scope.ServiceProvider.GetRequiredService<IPhotoMetadataService>();
+                    await photoService.ScanConfiguredDirectoriesAsync();
+                    _logger.LogInformation("图片后台增量索引完成");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "PhotoMetadataHostedService 后台索引执行失败");
+                }
+            }, cancellationToken);
+
+            return Task.CompletedTask;
         }
 
         public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;

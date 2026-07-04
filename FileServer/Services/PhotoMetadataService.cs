@@ -1,12 +1,14 @@
 ﻿using System.Collections.Concurrent;
 using System.Text.Json;
 using FileServer.Models;
+using LiteDB;
 using MetadataExtractor;
 using MetadataExtractor.Formats.Exif;
 using MetadataExtractor.Formats.Jpeg;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Directory = MetadataExtractor.Directory;
+using Directory = MetadataExtractor.Directory;   // EXIF 目录类
+using Dir = System.IO.Directory;                 // 文件系统目录类
 
 namespace FileServer.Services
 {
@@ -14,154 +16,82 @@ namespace FileServer.Services
     {
         private readonly ILogger<PhotoMetadataService> _logger;
         private readonly IConfiguration _configuration;
+        private readonly string _rootPath;
+        private readonly LiteDatabase _db;
+        private readonly ILiteCollection<PhotoMetadata> _collection;
 
-        // ========== 静态字段：全局唯一，跨实例共享 ==========
         private static readonly ConcurrentDictionary<string, PhotoMetadata> _cache = new();
-        private static readonly SemaphoreSlim _fileLock = new(1, 1);
-        private static Timer? _autoSaveTimer;
-        private static bool _isDirty;
-        private static readonly object _timerInitLock = new();
-        private static string _rootPath = string.Empty;
-        private static string _metadataFilePath = string.Empty;
 
         public static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
-{
-    ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif", ".gif"
-};
+        {
+            ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif", ".gif"
+        };
 
         public PhotoMetadataService(IFileService fileService, ILogger<PhotoMetadataService> logger, IConfiguration configuration)
         {
             _logger = logger;
             _configuration = configuration;
 
-            // 静态根路径和元数据文件路径只初始化一次
-            if (string.IsNullOrEmpty(_rootPath))
-            {
-                _rootPath = fileService.GetRootPath();
-                var metadataDir = configuration.GetValue<string>("FileServerConfig:MetadataDirectory") ?? ".metadata";
-                _metadataFilePath = Path.Combine(_rootPath, metadataDir, "photos.json");
-                var dir = Path.GetDirectoryName(_metadataFilePath);
-                if (!string.IsNullOrEmpty(dir))
-                    System.IO.Directory.CreateDirectory(dir);
-            }
+            _rootPath = fileService.GetRootPath();
 
-            // 加载已有持久化数据（只加载一次）
-            if (_cache.IsEmpty)
-            {
-                LoadFromFile();
-            }
+            // LiteDB 数据库（使用独立配置键 PhotoLiteDbPath）
+            var dbPath = configuration["FileServerConfig:PhotoLiteDbPath"];
+            if (string.IsNullOrEmpty(dbPath))
+                dbPath = Path.Combine(_rootPath, "photo-metadata.db");
 
-            // 初始化静态定时器（仅创建一次）
-            if (_autoSaveTimer == null)
-            {
-                lock (_timerInitLock)
-                {
-                    if (_autoSaveTimer == null)
-                    {
-                        _autoSaveTimer = new Timer(async _ => await SaveIfDirty(), null,
-                            TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
-                        _logger.LogInformation("全局元数据自动保存定时器已启动");
-                    }
-                }
-            }
+            // 确保数据库文件所在目录存在（使用 Dir 别名）
+            var dbDir = Path.GetDirectoryName(dbPath);
+            if (!string.IsNullOrEmpty(dbDir) && !Dir.Exists(dbDir))
+                Dir.CreateDirectory(dbDir);
+
+            _db = new LiteDatabase(dbPath);
+            _collection = _db.GetCollection<PhotoMetadata>("photoMetadata");
+            _collection.EnsureIndex(x => x.RelativePath, unique: true);
+            _collection.EnsureIndex(x => x.DateTaken);
+            _collection.EnsureIndex(x => x.Latitude);
+            _collection.EnsureIndex(x => x.Longitude);
+
+            LoadFromDatabase();
+            _logger.LogInformation("PhotoMetadataService 初始化完成，已加载 {Count} 条元数据", _cache.Count);
         }
 
-        // ---------- 静态方法：加载与保存 ----------
-        private static void LoadFromFile()
+        private void LoadFromDatabase()
         {
-            if (!System.IO.File.Exists(_metadataFilePath))
-                return;
-
-            _fileLock.Wait();
             try
             {
-                var json = System.IO.File.ReadAllText(_metadataFilePath);
-                var dict = JsonSerializer.Deserialize<Dictionary<string, PhotoMetadata>>(json);
-                if (dict != null)
-                {
-                    foreach (var kvp in dict)
-                        _cache.TryAdd(kvp.Key, kvp.Value);
-                    // 日志只能借助实例logger，但这是静态方法；此处忽略日志或传入logger
-                }
+                var all = _collection.FindAll().ToList();
+                foreach (var doc in all)
+                    _cache.TryAdd(doc.RelativePath, doc);
             }
             catch (Exception ex)
             {
-                // 静态方法无法使用实例logger，捕获后不做处理，或输出到控制台
-                System.Diagnostics.Debug.WriteLine($"加载元数据文件失败: {ex.Message}");
-            }
-            finally
-            {
-                _fileLock.Release();
+                _logger.LogError(ex, "从 LiteDB 加载图片元数据失败");
             }
         }
 
-        private static async Task SaveToFileAsync()
+        private void SaveToDatabase(PhotoMetadata metadata)
         {
-            await _fileLock.WaitAsync();
             try
             {
-                var snapshot = _cache.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
-                var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
-                await System.IO.File.WriteAllTextAsync(_metadataFilePath, json);
-                _isDirty = false;
+                _collection.Upsert(metadata);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"保存元数据文件失败: {ex.Message}");
-            }
-            finally
-            {
-                _fileLock.Release();
+                _logger.LogError(ex, "保存图片元数据到 LiteDB 失败: {Path}", metadata.RelativePath);
+                throw;
             }
         }
 
-        private static async Task SaveIfDirty()
+        private void DeleteFromDatabase(string relativePath)
         {
-            if (!_isDirty) return;
-            await SaveToFileAsync();
-        }
-
-        private static void MarkDirty() => _isDirty = true;
-
-        // ---------- 实例方法：扫描接口 ----------
-        public async Task ScanConfiguredDirectoriesAsync()
-        {
-            var indexDirs = _configuration.GetSection("FileServerConfig:PhotoIndexDirectories")
-                                          .Get<List<string>>() ?? new List<string>();
-            _logger.LogInformation("开始扫描配置的图片索引目录：{Dirs}", string.Join(", ", indexDirs));
-
-            foreach (var dir in indexDirs)
+            try
             {
-                await ScanDirectoryAsync(dir);
+                _collection.Delete(relativePath);
             }
-        }
-
-        public async Task ScanDirectoryAsync(string relativeDir, IProgress<string>? progress = null)
-        {
-            var fullDir = Path.Combine(_rootPath, relativeDir);
-            if (!System.IO.Directory.Exists(fullDir))
+            catch (Exception ex)
             {
-                _logger.LogWarning("图片索引目录不存在: {Dir}", fullDir);
-                return;
+                _logger.LogError(ex, "从 LiteDB 删除图片元数据失败: {Path}", relativePath);
             }
-
-            var allFiles = System.IO.Directory.GetFiles(fullDir, "*.*", SearchOption.AllDirectories)
-                .Where(f => ImageExtensions.Contains(Path.GetExtension(f)))
-                .Select(f => MakeRelativePath(f))
-                .ToList();
-
-            _logger.LogInformation("扫描目录 [{Dir}]，发现 {Count} 个文件", relativeDir, allFiles.Count);
-            int processed = 0;
-            foreach (var relPath in allFiles)
-            {
-                await ExtractAndCacheAsync(relPath);
-                processed++;
-                if (processed % 50 == 0)
-                    _logger.LogInformation("已扫描 {Processed}/{Total} 张图片", processed, allFiles.Count);
-            }
-
-            await SaveToFileAsync();
-            _logger.LogInformation("目录 [{Dir}] 扫描完成，新增/更新 {Count} 条元数据", relativeDir, processed);
         }
 
         public async Task<PhotoMetadata?> GetOrExtractMetadataAsync(string relativePath)
@@ -177,6 +107,14 @@ namespace FileServer.Services
                 }
                 return cached;
             }
+
+            var dbDoc = _collection.FindById(relativePath);
+            if (dbDoc != null)
+            {
+                _cache.TryAdd(relativePath, dbDoc);
+                return dbDoc;
+            }
+
             return await ExtractAndCacheAsync(relativePath);
         }
 
@@ -186,7 +124,8 @@ namespace FileServer.Services
             foreach (var path in relativePaths)
             {
                 var meta = await GetOrExtractMetadataAsync(path);
-                if (meta != null) result[path] = meta;
+                if (meta != null)
+                    result[path] = meta;
             }
             return result;
         }
@@ -228,22 +167,146 @@ namespace FileServer.Services
         public async Task RefreshMetadataAsync(string relativePath)
         {
             _cache.TryRemove(relativePath, out _);
-            MarkDirty();
+            DeleteFromDatabase(relativePath);
             await ExtractAndCacheAsync(relativePath);
         }
 
         public async Task ScanAndIndexAllPhotosAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
         {
-            // 仅扫描配置目录，保持与自动扫描一致
             await ScanConfiguredDirectoriesAsync();
             progress?.Report("全量索引完成（仅扫描配置目录）");
         }
 
-        // ---------- 私有方法：提取、路径转换 ----------
+        public async Task ScanConfiguredDirectoriesAsync()
+        {
+            var indexDirs = _configuration.GetSection("FileServerConfig:PhotoIndexDirectories")
+                                          .Get<List<string>>() ?? new List<string>();
+            _logger.LogInformation("开始扫描配置的图片索引目录：{Dirs}", string.Join(", ", indexDirs));
+
+            foreach (var dir in indexDirs)
+            {
+                await ScanDirectoryIncrementallyAsync(dir);
+            }
+        }
+
+        private async Task ScanDirectoryIncrementallyAsync(string relativeDir, IProgress<string>? progress = null)
+        {
+            var fullDir = Path.Combine(_rootPath, relativeDir);
+            if (!Dir.Exists(fullDir))   // 使用别名 Dir
+            {
+                _logger.LogWarning("图片索引目录不存在: {Dir}", fullDir);
+                return;
+            }
+
+            // 1. 获取磁盘文件信息（使用 Dir.GetFiles）
+            var diskFiles = Dir.GetFiles(fullDir, "*.*", SearchOption.AllDirectories)
+                .Where(f => ImageExtensions.Contains(Path.GetExtension(f)))
+                .Select(f =>
+                {
+                    var fi = new FileInfo(f);
+                    return new
+                    {
+                        Path = MakeRelativePath(f),
+                        LastWrite = fi.LastWriteTimeUtc,
+                        Size = fi.Length
+                    };
+                })
+                .ToList();
+
+            _logger.LogInformation("扫描目录 [{Dir}]，发现 {Count} 个图片文件", relativeDir, diskFiles.Count);
+
+            // 2. 从数据库加载该目录下的记录（简化过滤，实际更严谨可用前缀匹配）
+            var dirPrefix = relativeDir.Replace('\\', '/');
+            if (!dirPrefix.EndsWith('/')) dirPrefix += '/';
+            var dbRecords = _collection.Find(x => x.RelativePath.StartsWith(dirPrefix))
+                                       .ToDictionary(m => m.RelativePath);
+
+            // 3. 分类变化
+            var toAdd = new List<string>();
+            var toUpdate = new List<string>();
+            var toDelete = new List<string>();
+
+            var diskPaths = new HashSet<string>(diskFiles.Select(f => f.Path));
+            foreach (var diskFile in diskFiles)
+            {
+                if (dbRecords.TryGetValue(diskFile.Path, out var existing))
+                {
+                    if (existing.LastModified != diskFile.LastWrite || existing.FileSize != diskFile.Size)
+                        toUpdate.Add(diskFile.Path);
+                }
+                else
+                {
+                    toAdd.Add(diskFile.Path);
+                }
+            }
+
+            foreach (var dbPath in dbRecords.Keys)
+            {
+                if (!diskPaths.Contains(dbPath))
+                    toDelete.Add(dbPath);
+            }
+
+            int totalChanges = toAdd.Count + toUpdate.Count + toDelete.Count;
+            if (totalChanges == 0)
+            {
+                _logger.LogInformation("目录 [{Dir}] 无变化，跳过", relativeDir);
+                return;
+            }
+
+            _logger.LogInformation("目录 [{Dir}] 变化：新增 {Add}，更新 {Update}，删除 {Delete}",
+                relativeDir, toAdd.Count, toUpdate.Count, toDelete.Count);
+
+            // 4. 处理删除
+            foreach (var path in toDelete)
+            {
+                _cache.TryRemove(path, out _);
+                DeleteFromDatabase(path);
+            }
+
+            // 5. 处理新增和更新
+            var toProcess = toAdd.Concat(toUpdate).ToList();
+            int processed = 0;
+            foreach (var path in toProcess)
+            {
+                try
+                {
+                    await ExtractAndCacheAsync(path);
+                    processed++;
+                    if (processed % 50 == 0)
+                        _logger.LogInformation("已处理 {Processed}/{Total} 张图片", processed, toProcess.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "提取图片元数据失败: {Path}", path);
+                }
+            }
+
+            _logger.LogInformation("目录 [{Dir}] 扫描完成，成功处理 {Processed} 个文件", relativeDir, processed);
+        }
+
+        public async Task<bool> DeleteMetadataAsync(string relativePath)
+        {
+            try
+            {
+                if (_cache.TryRemove(relativePath, out _))
+                {
+                    DeleteFromDatabase(relativePath);
+                    _logger.LogInformation("图片元数据已删除: {Path}", relativePath);
+                    return true;
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除图片元数据失败: {Path}", relativePath);
+                return false;
+            }
+        }
+
         private async Task<PhotoMetadata?> ExtractAndCacheAsync(string relativePath)
         {
             var fullPath = Path.Combine(_rootPath, relativePath);
-            if (!System.IO.File.Exists(fullPath))
+            if (!File.Exists(fullPath))
                 return null;
 
             var extension = Path.GetExtension(fullPath);
@@ -257,37 +320,25 @@ namespace FileServer.Services
                 var gpsDir = directories.OfType<GpsDirectory>().FirstOrDefault();
                 var ifd0Dir = directories.OfType<ExifIfd0Directory>().FirstOrDefault();
 
-                // ===== 提取拍摄日期（依次尝试多个 EXIF 标签）=====
                 DateTime? dateTaken = null;
-
-                // 1. Exif SubIFD 的原始拍摄时间
                 if (exifSubIfd != null && exifSubIfd.TryGetDateTime(ExifDirectoryBase.TagDateTimeOriginal, out var dt1))
                     dateTaken = dt1;
-
-                // 2. Exif SubIFD 的数字化时间
                 if (!dateTaken.HasValue && exifSubIfd != null && exifSubIfd.TryGetDateTime(ExifDirectoryBase.TagDateTimeDigitized, out var dt2))
                     dateTaken = dt2;
-
-                // 3. IFD0 的主日期时间
                 if (!dateTaken.HasValue && ifd0Dir != null && ifd0Dir.TryGetDateTime(ExifIfd0Directory.TagDateTime, out var dt3))
                     dateTaken = dt3;
-
-                // 4. 尝试 PNG 文件的最后修改时间（如果文件是 PNG）
                 if (!dateTaken.HasValue)
                 {
                     var pngDir = directories.OfType<MetadataExtractor.Formats.Png.PngDirectory>().FirstOrDefault();
                     if (pngDir != null && pngDir.TryGetDateTime(MetadataExtractor.Formats.Png.PngDirectory.TagLastModificationTime, out var dt4))
                         dateTaken = dt4;
                 }
-
-                // 5. 若所有标签均无，回退到文件修改时间，保证排序可用
                 if (!dateTaken.HasValue)
                 {
                     var fileInfoTemp = new FileInfo(fullPath);
                     dateTaken = fileInfoTemp.LastWriteTime;
                 }
 
-                // ===== GPS 信息 =====
                 double? lat = null, lng = null;
                 if (gpsDir != null)
                 {
@@ -299,20 +350,13 @@ namespace FileServer.Services
                     }
                 }
 
-                // ===== 相机型号 =====
                 string? cameraModel = ifd0Dir?.GetString(ExifIfd0Directory.TagModel);
 
-                // ===== 图片尺寸（安全读取，防止缺失标签时崩溃）=====
                 int? width = null, height = null;
                 var jpegDir = directories.OfType<JpegDirectory>().FirstOrDefault();
                 if (jpegDir != null)
                 {
-                    try
-                    {
-                        width = jpegDir.GetImageWidth();
-                        height = jpegDir.GetImageHeight();
-                    }
-                    catch { /* 忽略 */ }
+                    try { width = jpegDir.GetImageWidth(); height = jpegDir.GetImageHeight(); } catch { }
                 }
                 if ((!width.HasValue || !height.HasValue) && ifd0Dir != null)
                 {
@@ -321,10 +365,9 @@ namespace FileServer.Services
                         width ??= ifd0Dir.GetInt32(ExifDirectoryBase.TagImageWidth);
                         height ??= ifd0Dir.GetInt32(ExifDirectoryBase.TagImageHeight);
                     }
-                    catch (MetadataException) { /* 忽略缺失的标签 */ }
+                    catch (MetadataException) { }
                 }
 
-                // ===== 构造元数据对象 =====
                 var fileInfo = new FileInfo(fullPath);
                 var metadata = new PhotoMetadata
                 {
@@ -342,8 +385,9 @@ namespace FileServer.Services
                 };
 
                 _cache.AddOrUpdate(relativePath, metadata, (_, _) => metadata);
-                MarkDirty();
-                _logger.LogInformation("已提取并缓存: {Path}", relativePath);
+                SaveToDatabase(metadata);
+
+                _logger.LogDebug("已提取并缓存: {Path}", relativePath);
                 return metadata;
             }
             catch (Exception ex)
@@ -362,9 +406,7 @@ namespace FileServer.Services
 
         public void Dispose()
         {
-            // 实例释放时不销毁静态定时器和锁，全局资源由应用程序生命周期管理
-            // 仅做最后一次保存（如果当前实例修改了缓存）
-            SaveToFileAsync().GetAwaiter().GetResult();
+            _db?.Dispose();
         }
     }
 }
