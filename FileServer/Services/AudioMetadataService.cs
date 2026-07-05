@@ -1,14 +1,15 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using FileServer.Models;
 using LiteDB;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using TagLib;
-using FileServer.Models;
 using SystemFile = System.IO.File;
 using TagFile = TagLib.File;
 
@@ -430,55 +431,70 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     /// </summary>
     public async Task<Dictionary<string, SongMetadata>> GetBatchMetadataAsync(List<string> paths)
     {
+        var sw = Stopwatch.StartNew();
         var result = new Dictionary<string, SongMetadata>();
         var missingPaths = new List<string>();
 
-        // 1. 从内存缓存获取
+        // 1. 内存缓存
         foreach (var path in paths)
         {
             if (_cache.TryGetValue(path, out var cached))
-            {
                 result[path] = cached;
-            }
             else
-            {
                 missingPaths.Add(path);
-            }
         }
+        _logger.LogInformation("Step1 Cache hit: {HitCount}, missing: {MissingCount}, elapsed: {Elapsed}ms",
+            result.Count, missingPaths.Count, sw.ElapsedMilliseconds);
 
-        // 2. 从 LiteDB 批量获取缺失的
+        // 2. LiteDB 批量查询
         if (missingPaths.Any())
         {
-            // 使用 LiteDB 的 Contains 查询（或构建 Filter.In）
-            // 替换原有的 LINQ Contains
+            sw.Restart();
             var bsonValues = missingPaths.Select(p => new BsonValue(p)).ToList();
             var bsonArray = new BsonArray(bsonValues);
             var dbResults = _collection.Find(Query.In("FilePath", bsonArray)).ToList();
+            _logger.LogInformation("Step2 LiteDB found: {DbCount}, elapsed: {Elapsed}ms",
+                dbResults.Count, sw.ElapsedMilliseconds);
+
+            sw.Restart();
             foreach (var meta in dbResults)
             {
                 _cache.TryAdd(meta.FilePath, meta);
                 result[meta.FilePath] = meta;
                 missingPaths.Remove(meta.FilePath);
             }
+            _logger.LogInformation("Step2 update cache elapsed: {Elapsed}ms", sw.ElapsedMilliseconds);
         }
 
-        // 3. 对仍缺失的路径，提取并缓存（极少情况）
-        foreach (var path in missingPaths)
+        // 3. 实时提取（最昂贵）
+        if (missingPaths.Any())
         {
-            try
+            sw.Restart();
+            foreach (var path in missingPaths)
             {
-                var meta = await ExtractAndCacheAsync(path);
-                result[path] = meta;
+                try
+                {
+                    var meta = await ExtractAndCacheAsync(path);
+                    result[path] = meta;
+                }
+                catch
+                {
+                    result[path] = FallbackMetadata(path);
+                }
             }
-            catch
-            {
-                result[path] = FallbackMetadata(path);
-            }
+            _logger.LogInformation("Step3 Extract & cache {Count} files, elapsed: {Elapsed}ms",
+                missingPaths.Count, sw.ElapsedMilliseconds);
         }
 
         return result;
     }
-
+    /// <summary>
+    /// 检查数据库是否为空（无任何元数据记录）
+    /// </summary>
+    public Task<bool> IsEmptyAsync()
+    {
+        return Task.FromResult(_collection.Count() == 0);
+    }
     public void Dispose()
     {
         _db?.Dispose();

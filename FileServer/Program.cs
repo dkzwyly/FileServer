@@ -6,17 +6,15 @@ using System.Diagnostics;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. 配置绑定 - 使用 FileServerConfig 节点
+// 1. 配置绑定
 builder.Services.Configure<FileServerConfig>(
     builder.Configuration.GetSection("FileServerConfig"));
 
-// 2. 注册 ThumbnailService 具体类（改为 Singleton）
-builder.Services.AddSingleton<ThumbnailService>();
-// 3. 注册 ThumbnailService 接口指向具体类（Singleton）
-builder.Services.AddSingleton<IThumbnailService>(provider =>
-    provider.GetRequiredService<ThumbnailService>());
+// 2. 新增：文件系统帮助器（打破循环依赖）
+builder.Services.AddSingleton<IFileSystemHelper, FileSystemHelper>();
 
-// 4. 注册其他服务（统一改为 Singleton，避免生命周期冲突）
+// 3. 注册核心服务（所有服务统一为 Singleton）
+builder.Services.AddSingleton<IThumbnailService, ThumbnailService>();
 builder.Services.AddSingleton<IServerStatusService, ServerStatusService>();
 builder.Services.AddSingleton<IFileService, FileService>();
 builder.Services.AddSingleton<IMemoryMappedFileService, MemoryMappedFileService>();
@@ -24,22 +22,25 @@ builder.Services.AddSingleton<IChapterIndexService, ChapterIndexService>();
 builder.Services.AddSingleton<IFileConflictService, FileConflictService>();
 builder.Services.AddSingleton<IAudioMetadataService, AudioMetadataService>();
 builder.Services.AddSingleton<IPhotoMetadataService, PhotoMetadataService>();
-builder.Services.AddMemoryCache();  // MemoryCache 是单例模式，无需修改
 builder.Services.AddSingleton<ILyricsMappingService, LyricsMappingService>();
+builder.Services.AddSingleton<IFileTreeCacheService, FileTreeCacheService>();  // 依赖 IFileSystemHelper，无循环
 
-
-// 后台服务（HostedService 生命周期由主机管理，保持不变）
+// 4. 注册后台托管服务
+builder.Services.AddHostedService<FileTreeSaveService>();        // 每日5点增量同步
 builder.Services.AddHostedService<PhotoMetadataHostedService>();
 builder.Services.AddHostedService<AudioMetadataHostedService>();
 
-// 5. VideoThumbnailService（已是 Singleton）
+// 5. VideoThumbnailService（同时作为 IVideoThumbnailService 和 IHostedService）
 builder.Services.AddSingleton<VideoThumbnailService>();
-builder.Services.AddSingleton<IHostedService>(provider =>
-    provider.GetRequiredService<VideoThumbnailService>());
 builder.Services.AddSingleton<IVideoThumbnailService>(provider =>
     provider.GetRequiredService<VideoThumbnailService>());
+builder.Services.AddSingleton<IHostedService>(provider =>
+    provider.GetRequiredService<VideoThumbnailService>());
 
-// 6. 添加控制器
+// 6. 内存缓存（单例）
+builder.Services.AddMemoryCache();
+
+// 7. 控制器
 builder.Services.AddControllers();
 
 // 创建并信任开发者证书

@@ -423,28 +423,19 @@ namespace FileServer.Controllers
         }
 
         [HttpPost("directory/{*path}")]
-        public IActionResult CreateDirectory(string path)
+        public async Task<IActionResult> CreateDirectory(string path)
         {
             try
             {
                 _statusService.IncrementRequests();
-
-                var physicalPath = Path.Combine(_fileService.GetRootPath(), path);
-                if (!Directory.Exists(physicalPath))
-                {
-                    Directory.CreateDirectory(physicalPath);
-                    _logger.LogInformation("创建目录: {Path}", physicalPath);
-                    return Ok(new { success = true, message = "目录创建成功" });
-                }
-                else
-                {
-                    return BadRequest(new { success = false, message = "目录已存在" });
-                }
+                path = WebUtility.UrlDecode(path);
+                await _fileService.CreateDirectoryAsync(path);
+                return Ok(new { success = true, message = "目录创建成功" });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "创建目录失败: {Path}", path);
-                return StatusCode(500, new { success = false, message = $"创建目录失败: {ex.Message}" });
+                return StatusCode(500, new { success = false, message = ex.Message });
             }
         }
 

@@ -54,5 +54,10 @@ namespace FileServer.Services
         /// <param name="musicDirectory">音乐文件根目录</param>
         /// <param name="progress">可选的进度报告器</param>
         Task ScanAndIndexAllAsync(string musicDirectory, IProgress<string>? progress = null);
+
+        /// <summary>
+        /// 检查数据库是否为空（无任何元数据记录）
+        /// </summary>
+        Task<bool> IsEmptyAsync();
     }
 }

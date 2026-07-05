@@ -1,6 +1,9 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileServer.Services
 {
@@ -17,7 +20,7 @@ namespace FileServer.Services
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("PhotoMetadataHostedService 启动，将在后台触发图片增量索引...");
+            _logger.LogInformation("PhotoMetadataHostedService 启动，检查数据库状态...");
 
             _ = Task.Run(async () =>
             {
@@ -25,12 +28,23 @@ namespace FileServer.Services
                 {
                     using var scope = _scopeFactory.CreateScope();
                     var photoService = scope.ServiceProvider.GetRequiredService<IPhotoMetadataService>();
-                    await photoService.ScanConfiguredDirectoriesAsync();
-                    _logger.LogInformation("图片后台增量索引完成");
+
+                    var isEmpty = await photoService.IsEmptyAsync();
+
+                    if (isEmpty)
+                    {
+                        _logger.LogInformation("数据库为空，执行全量索引（扫描配置目录）...");
+                        await photoService.ScanConfiguredDirectoriesAsync();
+                        _logger.LogInformation("图片全量索引完成");
+                    }
+                    else
+                    {
+                        _logger.LogInformation("数据库已有数据，跳过扫描，按需更新（访问图片时自动检查变动）。");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "PhotoMetadataHostedService 后台索引执行失败");
+                    _logger.LogError(ex, "PhotoMetadataHostedService 启动检查或索引执行失败");
                 }
             }, cancellationToken);
 

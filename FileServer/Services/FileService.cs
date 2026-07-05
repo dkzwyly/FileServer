@@ -1,402 +1,55 @@
 ﻿using FileServer.Models;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using System.Text;
-using System.Text.Json;
-using System.Collections.Concurrent;
 
 namespace FileServer.Services
 {
-    public interface IFileService
-    {
-        Task<FileListResponse> GetFileListAsync(string relativePath);
-        Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath);
-        Task<FileInfoModel> GetFileInfoAsync(string filePath);
-        Task<UploadResponse> UploadFilesAsync(string targetPath, IFormFileCollection files);
-        Task<bool> FileExistsAsync(string filePath);
-        Task<bool> DirectoryExistsAsync(string directoryPath);
-        string FormatFileSize(long bytes);
-        string GetMimeType(string extension);
-        string GetRootPath();
-
-        Task<bool> DeleteFileAsync(string filePath);
-        Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath);
-    }
-
     public class FileService : IFileService
     {
         private readonly IThumbnailService _thumbnailService;
-        private readonly string _rootPath;
         private readonly ILogger<FileService> _logger;
         private readonly IFileConflictService _conflictService;
+        private readonly IFileTreeCacheService _treeCache;
+        private readonly IFileSystemHelper _fileSystemHelper;  // 新增
 
-        // ---------- 视频缓存相关 ----------
-        private readonly ConcurrentDictionary<string, VideoCacheEntry> _videoCache = new();
-        private readonly string _videoCacheFilePath;
-        private readonly object _videoCacheLock = new();
-        private bool _videoCacheLoaded = false;
-
-        private class VideoCacheEntry
+        public FileService(
+            IConfiguration configuration,
+            ILogger<FileService> logger,
+            IThumbnailService thumbnailService,
+            IFileConflictService conflictService,
+            IFileTreeCacheService treeCache,
+            IFileSystemHelper fileSystemHelper)  // 注入 helper
         {
-            public FileListResponse Response { get; set; } = null!;
-            public DateTime LastWriteTimeUtc { get; set; }
-        }
-
-        public FileService(IConfiguration configuration,
-                   ILogger<FileService> logger,
-                   ThumbnailService thumbnailService,
-                   IFileConflictService conflictService)
-        {
-            _rootPath = configuration["FileServerConfig:RootPath"]
-                ?? throw new InvalidOperationException("配置缺少 FileServerConfig:RootPath");
-            _rootPath = Path.GetFullPath(_rootPath);
-
             _logger = logger;
             _thumbnailService = thumbnailService;
             _conflictService = conflictService;
+            _treeCache = treeCache;
+            _fileSystemHelper = fileSystemHelper;
 
-            if (!Directory.Exists(_rootPath))
+            // 确保根目录存在
+            var rootPath = _fileSystemHelper.GetRootPath();
+            if (!Directory.Exists(rootPath))
             {
-                Directory.CreateDirectory(_rootPath);
-                _logger.LogInformation("创建根目录: {RootPath}", _rootPath);
-            }
-
-            // 初始化视频缓存文件路径（仍保留，但不强制依赖磁盘文件）
-            var cacheDir = configuration["FileServerConfig:MetadataDirectory"] ?? "系统文件";
-            var fullCacheDir = Path.Combine(_rootPath, cacheDir);
-            if (!Directory.Exists(fullCacheDir))
-                Directory.CreateDirectory(fullCacheDir);
-            _videoCacheFilePath = Path.Combine(fullCacheDir, "video_cache.json");
-
-            // ===== 新增：启动时同步预加载视频目录缓存 =====
-            try
-            {
-                PreloadVideoCache().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "启动预加载视频缓存失败，将在首次请求时按需扫描");
+                Directory.CreateDirectory(rootPath);
+                _logger.LogInformation("创建根目录: {RootPath}", rootPath);
             }
         }
 
-        // ==================== 视频缓存方法 ====================
-        /// <summary>
-        /// 启动时预加载 video 目录下所有子目录的文件列表缓存
-        /// </summary>
-        private async Task PreloadVideoCache()
-        {
-            var videoRoot = Path.Combine(_rootPath, "data", "影视");
-            if (!Directory.Exists(videoRoot))
-            {
-                _logger.LogWarning("视频根目录不存在，跳过预加载: {Path}", videoRoot);
-                return;
-            }
-
-            // 获取所有子目录（包括深层目录）
-            var directories = Directory.GetDirectories(videoRoot, "*", SearchOption.AllDirectories);
-
-            _logger.LogInformation("开始预加载视频目录缓存，共 {Count} 个目录", directories.Length);
-
-            int loadedCount = 0;
-            foreach (var dir in directories)
-            {
-                try
-                {
-                    var relativePath = Path.GetRelativePath(_rootPath, dir).Replace('\\', '/');
-                    var response = await BuildFileListResponse(relativePath);
-
-                    _videoCache[relativePath] = new VideoCacheEntry
-                    {
-                        Response = response,
-                        LastWriteTimeUtc = Directory.GetLastWriteTimeUtc(dir)
-                    };
-
-                    loadedCount++;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "预加载目录失败，跳过: {Dir}", dir);
-                }
-            }
-
-            _logger.LogInformation("预加载完成，成功缓存 {Loaded}/{Total} 个视频目录",
-                loadedCount, directories.Length);
-        }
-
-        private void LoadVideoCache()
-        {
-            try
-            {
-                if (File.Exists(_videoCacheFilePath))
-                {
-                    var json = File.ReadAllText(_videoCacheFilePath);
-                    var options = new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true,
-                        IncludeFields = true
-                    };
-                    var cacheData = JsonSerializer.Deserialize<Dictionary<string, VideoCacheEntry>>(json, options);
-                    if (cacheData != null)
-                    {
-                        foreach (var kv in cacheData)
-                            _videoCache.TryAdd(kv.Key, kv.Value);
-                        _logger.LogInformation("从磁盘加载视频缓存，共 {Count} 个条目", _videoCache.Count);
-                    }
-                }
-                _videoCacheLoaded = true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "加载视频缓存失败，将在首次访问时重新扫描");
-                if (File.Exists(_videoCacheFilePath))
-                {
-                    try { File.Delete(_videoCacheFilePath); } catch { }
-                }
-                _videoCacheLoaded = false;
-            }
-        }
-
-        private void SaveVideoCache()
-        {
-            try
-            {
-                var cacheData = _videoCache.ToDictionary(
-                    kv => kv.Key,
-                    kv => new
-                    {
-                        // 这里需要 CachedResponse 属性，如果你未修改 VideoCacheEntry，
-                        // 可以暂时注释掉 SaveVideoCache 的调用，或者只序列化部分字段
-                        kv.Value.Response,
-                        kv.Value.LastWriteTimeUtc
-                    }
-                );
-
-                var options = new JsonSerializerOptions { WriteIndented = true };
-                var json = JsonSerializer.Serialize(cacheData, options);
-
-                var tempFile = _videoCacheFilePath + ".tmp";
-                File.WriteAllText(tempFile, json);
-                File.Move(tempFile, _videoCacheFilePath, true);
-
-                _logger.LogInformation("✅ 视频缓存已保存");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "❌ 保存视频缓存失败（不影响正常运行）");
-                // 不要 throw
-            }
-        }
-
-        // ==================== 公共方法 ====================
+        // ==================== 实现接口 ====================
 
         public async Task<FileListResponse> GetFileListAsync(string relativePath)
         {
-            var normalized = relativePath?.Replace('\\', '/').Trim('/') ?? "";
-            _logger.LogInformation("GetFileListAsync 原始路径: {Raw}, 规范化后: {Normalized}", relativePath, normalized);
-
-            // 视频目录专用缓存逻辑
-            if (normalized.StartsWith("data/影视", StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogInformation("★★★ 进入视频缓存分支 ★★★ 路径: {Path}", normalized);
-
-                // 1. 尝试从内存缓存直接返回
-                if (_videoCache.TryGetValue(normalized, out var cachedEntry))
-                {
-                    _logger.LogInformation("📀 从启动缓存直接返回（无IO）: {Path}", normalized);
-                    return cachedEntry.Response;
-                }
-
-                // 2. 缓存未命中（可能是启动后新增的目录），执行扫描并加入缓存
-                _logger.LogInformation("⚠️ 缓存未命中，执行磁盘扫描并加入缓存: {Path}", normalized);
-                var physicalPath = Path.Combine(_rootPath, normalized);
-                if (!Directory.Exists(physicalPath))
-                {
-                    _logger.LogWarning("视频目录不存在: {Path}", physicalPath);
-                    throw new DirectoryNotFoundException($"目录不存在: {normalized}");
-                }
-
-                var response = await BuildFileListResponse(normalized);
-
-                var newEntry = new VideoCacheEntry
-                {
-                    Response = response,
-                    LastWriteTimeUtc = Directory.GetLastWriteTimeUtc(physicalPath)
-                };
-                _videoCache[normalized] = newEntry;
-
-                // 可选：将新增的缓存持久化到磁盘（如果你仍想保留磁盘缓存）
-                try
-                {
-                    SaveVideoCache();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "持久化新缓存失败，但不影响当前请求");
-                }
-
-                return response;
-            }
-            else
-            {
-                // 非视频目录，保持原有实时扫描逻辑
-                _logger.LogInformation("普通路径（非视频目录），实时扫描: {Path}", normalized);
-                return await BuildFileListResponse(normalized);
-            }
+            return await _treeCache.GetDirectoryContentAsync(relativePath);
         }
-
-        /// <summary>
-        /// 构建文件列表响应（不缓存，实时扫描）
-        /// </summary>
-        private async Task<FileListResponse> BuildFileListResponse(string normalizedPath)
-        {
-            var physicalPath = Path.Combine(_rootPath, normalizedPath);
-
-            if (!physicalPath.StartsWith(_rootPath))
-                physicalPath = _rootPath;
-
-            if (!Directory.Exists(physicalPath))
-                throw new DirectoryNotFoundException($"目录不存在: {normalizedPath}");
-
-            var response = new FileListResponse
-            {
-                CurrentPath = normalizedPath,
-                ParentPath = GetParentPath(normalizedPath)
-            };
-
-            try
-            {
-                var directories = await Task.Run(() => Directory.GetDirectories(physicalPath));
-                var files = await Task.Run(() => Directory.GetFiles(physicalPath));
-
-                foreach (var dir in directories)
-                {
-                    try
-                    {
-                        var dirInfo = new DirectoryInfo(dir);
-                        response.Directories.Add(new DirectoryInfoModel
-                        {
-                            Name = dirInfo.Name,
-                            Path = Path.Combine(normalizedPath, dirInfo.Name).Replace("\\", "/")
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "处理目录失败: {Directory}", dir);
-                    }
-                }
-
-                foreach (var file in files)
-                {
-                    try
-                    {
-                        var fileInfo = new FileInfo(file);
-                        var extension = Path.GetExtension(file).ToLowerInvariant();
-                        var relativeFilePath = Path.Combine(normalizedPath, fileInfo.Name).Replace("\\", "/");
-
-                        var fileModel = new FileInfoModel
-                        {
-                            Name = fileInfo.Name,
-                            Path = relativeFilePath,
-                            Size = fileInfo.Length,
-                            SizeFormatted = FormatFileSize(fileInfo.Length),
-                            Extension = extension,
-                            LastModified = fileInfo.LastWriteTime,
-                            IsVideo = IsVideoFile(extension),
-                            IsAudio = IsAudioFile(extension),
-                            MimeType = GetMimeType(extension),
-                            Encoding = IsTextFile(extension) ? "utf-8" : "",
-                            HasThumbnail = false
-                        };
-
-                        if (IsImageFile(extension))
-                        {
-                            fileModel.HasThumbnail = await _thumbnailService.ThumbnailExistsAsync(relativeFilePath);
-                        }
-
-                        response.Files.Add(fileModel);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "处理文件失败: {File}", file);
-                    }
-                }
-
-                _logger.LogInformation("返回目录列表: {Path} - {DirCount} 目录, {FileCount} 文件",
-                    normalizedPath, response.Directories.Count, response.Files.Count);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "读取文件列表失败: {Path}", normalizedPath);
-                throw;
-            }
-
-            return response;
-        }
-
-        // ==================== 文件信息 ====================
-
-        public async Task<FileInfoModel> GetFileInfoAsync(string filePath)
-        {
-            var physicalPath = Path.Combine(_rootPath, filePath);
-
-            if (!File.Exists(physicalPath))
-            {
-                throw new FileNotFoundException($"文件不存在: {filePath}");
-            }
-
-            return await Task.Run(() =>
-            {
-                var fileInfo = new FileInfo(physicalPath);
-                var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
-
-                return new FileInfoModel
-                {
-                    Name = fileInfo.Name,
-                    Path = filePath,
-                    Size = fileInfo.Length,
-                    SizeFormatted = FormatFileSize(fileInfo.Length),
-                    Extension = extension,
-                    LastModified = fileInfo.LastWriteTime,
-                    IsVideo = IsVideoFile(extension),
-                    IsAudio = IsAudioFile(extension),
-                    MimeType = GetMimeType(extension),
-                    Encoding = IsTextFile(extension) ? "utf-8" : ""
-                };
-            });
-        }
-
-        // ==================== 下载文件 ====================
-
-        public async Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath)
-        {
-            var physicalPath = Path.Combine(_rootPath, filePath);
-
-            if (!File.Exists(physicalPath))
-            {
-                throw new FileNotFoundException($"文件不存在: {filePath}");
-            }
-
-            var fileInfo = new FileInfo(physicalPath);
-            var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
-            var contentType = GetMimeType(extension);
-
-            if (extension == ".wmv")
-            {
-                contentType = "video/x-ms-wmv";
-            }
-
-            var stream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-
-            _logger.LogInformation("文件下载: {FileName} (大小: {Size})", fileInfo.Name, FormatFileSize(fileInfo.Length));
-
-            return await Task.FromResult((stream, contentType, fileInfo.Name));
-        }
-
-        // ==================== 上传文件 ====================
 
         public async Task<UploadResponse> UploadFilesAsync(string targetPath, IFormFileCollection files)
         {
+            var rootPath = _fileSystemHelper.GetRootPath();
             var uploadPath = string.IsNullOrEmpty(targetPath)
-                ? _rootPath
-                : Path.Combine(_rootPath, targetPath);
+                ? rootPath
+                : Path.Combine(rootPath, targetPath);
 
             if (!Directory.Exists(uploadPath))
             {
@@ -466,13 +119,11 @@ namespace FileServer.Services
 
                 try
                 {
-                    // 保存文件
                     using (var stream = new FileStream(filePath, FileMode.Create))
                     {
                         await file.CopyToAsync(stream);
                     }
 
-                    // 验证文件内容
                     var fileInfo = new FileInfo(filePath);
                     if (!fileInfo.Exists || fileInfo.Length == 0)
                     {
@@ -481,26 +132,24 @@ namespace FileServer.Services
                         continue;
                     }
 
-                    // 验证文件格式
                     var extension = Path.GetExtension(fileName).ToLowerInvariant();
                     await ValidateFileFormat(filePath, extension, originalFileName);
 
-                    totalSize += fileInfo.Length;
-
-                    uploadedFiles.Add(new UploadedFileInfo
+                    // ===== 添加节点到缓存 =====
+                    var node = new FileNode
                     {
-                        OriginalName = originalFileName,
-                        SavedName = fileName,
                         Path = relativeFilePath,
+                        Name = fileName,
+                        ParentPath = string.IsNullOrEmpty(targetPath) ? "" : targetPath.Replace("\\", "/"),
+                        IsDirectory = false,
                         Size = fileInfo.Length,
-                        WasRenamed = originalFileName != fileName,
-                        RenameReason = originalFileName != fileName ?
-                            (originalFileName != originalFileNameForConflict ?
-                                "非法字符处理" : "重名冲突") : ""
-                    });
-
-                    _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
-                        fileName, filePath, FormatFileSize(fileInfo.Length));
+                        LastModified = fileInfo.LastWriteTimeUtc,
+                        MimeType = _fileSystemHelper.GetMimeType(extension),
+                        IsVideo = IsVideoFile(extension),
+                        IsAudio = IsAudioFile(extension),
+                        IsImage = IsImageFile(extension)
+                    };
+                    await _treeCache.AddNodeAsync(node);
 
                     // 如果是图片文件，生成缩略图
                     if (IsImageFile(extension))
@@ -518,6 +167,23 @@ namespace FileServer.Services
                             }
                         });
                     }
+
+                    totalSize += fileInfo.Length;
+
+                    uploadedFiles.Add(new UploadedFileInfo
+                    {
+                        OriginalName = originalFileName,
+                        SavedName = fileName,
+                        Path = relativeFilePath,
+                        Size = fileInfo.Length,
+                        WasRenamed = originalFileName != fileName,
+                        RenameReason = originalFileName != fileName ?
+                            (originalFileName != originalFileNameForConflict ?
+                                "非法字符处理" : "重名冲突") : ""
+                    });
+
+                    _logger.LogInformation("文件上传成功: {FileName} -> {FilePath} (大小: {Size})",
+                        fileName, filePath, _fileSystemHelper.FormatFileSize(fileInfo.Length));
                 }
                 catch (Exception ex)
                 {
@@ -541,7 +207,7 @@ namespace FileServer.Services
                 _logger.LogInformation("上传完成: {FileCount} 个文件成功，{FailedCount} 个失败，" +
                                       "总大小: {TotalSize}，重命名: {RenameCount}",
                     uploadedFiles.Count - failedCount, failedCount,
-                    FormatFileSize(totalSize), renameCount);
+                    _fileSystemHelper.FormatFileSize(totalSize), renameCount);
             }
             else
             {
@@ -563,7 +229,6 @@ namespace FileServer.Services
                 FailedUploads = failedCount
             };
 
-            // 向后兼容
             response.Files = uploadedFiles
                 .Where(f => string.IsNullOrEmpty(f.RenameReason) || !f.RenameReason.StartsWith("上传失败"))
                 .Select(f => f.SavedName)
@@ -574,69 +239,12 @@ namespace FileServer.Services
             return response;
         }
 
-        // ==================== 文件验证辅助 ====================
-
-        private async Task ValidateFileFormat(string filePath, string extension, string originalFileName)
-        {
-            try
-            {
-                if (extension == ".gif")
-                {
-                    await ValidateGifFile(filePath, originalFileName);
-                }
-                else if (IsImageFile(extension))
-                {
-                    await ValidateImageFile(filePath, originalFileName, extension);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "文件格式验证失败: {FileName}", originalFileName);
-            }
-        }
-
-        private async Task ValidateGifFile(string filePath, string originalFileName)
-        {
-            using var fileStream = File.OpenRead(filePath);
-            var buffer = new byte[6];
-            await fileStream.ReadAsync(buffer, 0, 6);
-
-            var header = Encoding.ASCII.GetString(buffer);
-            if (header == "GIF87a" || header == "GIF89a")
-            {
-                _logger.LogInformation("GIF 文件验证成功: {FileName}", originalFileName);
-            }
-            else
-            {
-                _logger.LogWarning("GIF 文件可能已损坏或格式不正确: {FileName} (头部: {Header})",
-                    originalFileName, header);
-            }
-        }
-
-        private async Task ValidateImageFile(string filePath, string originalFileName, string extension)
-        {
-            try
-            {
-                using var fileStream = File.OpenRead(filePath);
-                var buffer = new byte[8];
-                await fileStream.ReadAsync(buffer, 0, 8);
-
-                var hex = BitConverter.ToString(buffer).Replace("-", "");
-                _logger.LogDebug("图像文件 {FileName} 头部: {Header}", originalFileName, hex);
-            }
-            catch
-            {
-                // 忽略验证错误
-            }
-        }
-
-        // ==================== 删除文件 ====================
-
         public async Task<bool> DeleteFileAsync(string filePath)
         {
             try
             {
-                var physicalPath = Path.Combine(_rootPath, filePath);
+                var rootPath = _fileSystemHelper.GetRootPath();
+                var physicalPath = Path.Combine(rootPath, filePath);
                 if (!File.Exists(physicalPath))
                 {
                     return false;
@@ -650,6 +258,8 @@ namespace FileServer.Services
                     await _thumbnailService.DeleteThumbnailAsync(filePath);
                 }
 
+                await _treeCache.RemoveNodeAsync(filePath);
+
                 _logger.LogInformation("删除文件成功: {FilePath}", filePath);
                 return true;
             }
@@ -660,7 +270,85 @@ namespace FileServer.Services
             }
         }
 
-        // ==================== 缩略图 ====================
+        public async Task CreateDirectoryAsync(string relativePath)
+        {
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var physicalPath = Path.Combine(rootPath, relativePath);
+            if (Directory.Exists(physicalPath))
+                throw new InvalidOperationException($"目录已存在: {relativePath}");
+
+            Directory.CreateDirectory(physicalPath);
+            var dirInfo = new DirectoryInfo(physicalPath);
+
+            var node = new FileNode
+            {
+                Path = relativePath.Replace("\\", "/"),
+                Name = Path.GetFileName(relativePath),
+                ParentPath = GetParentPath(relativePath),
+                IsDirectory = true,
+                LastModified = dirInfo.LastWriteTimeUtc,
+                MimeType = ""
+            };
+            await _treeCache.AddNodeAsync(node);
+            _logger.LogInformation("创建目录成功: {RelativePath}", relativePath);
+        }
+
+        public async Task<(Stream Stream, string ContentType, string FileName)> DownloadFileAsync(string filePath)
+        {
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var physicalPath = Path.Combine(rootPath, filePath);
+
+            if (!File.Exists(physicalPath))
+            {
+                throw new FileNotFoundException($"文件不存在: {filePath}");
+            }
+
+            var fileInfo = new FileInfo(physicalPath);
+            var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
+            var contentType = _fileSystemHelper.GetMimeType(extension);
+
+            if (extension == ".wmv")
+            {
+                contentType = "video/x-ms-wmv";
+            }
+
+            var stream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+            _logger.LogInformation("文件下载: {FileName} (大小: {Size})", fileInfo.Name, _fileSystemHelper.FormatFileSize(fileInfo.Length));
+
+            return await Task.FromResult((stream, contentType, fileInfo.Name));
+        }
+
+        public async Task<FileInfoModel> GetFileInfoAsync(string filePath)
+        {
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var physicalPath = Path.Combine(rootPath, filePath);
+
+            if (!File.Exists(physicalPath))
+            {
+                throw new FileNotFoundException($"文件不存在: {filePath}");
+            }
+
+            return await Task.Run(() =>
+            {
+                var fileInfo = new FileInfo(physicalPath);
+                var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
+
+                return new FileInfoModel
+                {
+                    Name = fileInfo.Name,
+                    Path = filePath,
+                    Size = fileInfo.Length,
+                    SizeFormatted = _fileSystemHelper.FormatFileSize(fileInfo.Length),
+                    Extension = extension,
+                    LastModified = fileInfo.LastWriteTime,
+                    IsVideo = IsVideoFile(extension),
+                    IsAudio = IsAudioFile(extension),
+                    MimeType = _fileSystemHelper.GetMimeType(extension),
+                    Encoding = IsTextFile(extension) ? "utf-8" : ""
+                };
+            });
+        }
 
         public async Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath)
         {
@@ -674,95 +362,26 @@ namespace FileServer.Services
             return (stream, "image/jpeg", $"{Path.GetFileNameWithoutExtension(filePath)}_thumb.jpg");
         }
 
-        // ==================== 其他基础方法 ====================
-
         public Task<bool> FileExistsAsync(string filePath)
         {
-            var physicalPath = Path.Combine(_rootPath, filePath);
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var physicalPath = Path.Combine(rootPath, filePath);
             return Task.FromResult(File.Exists(physicalPath));
         }
 
         public Task<bool> DirectoryExistsAsync(string directoryPath)
         {
-            var physicalPath = Path.Combine(_rootPath, directoryPath);
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var physicalPath = Path.Combine(rootPath, directoryPath);
             return Task.FromResult(Directory.Exists(physicalPath));
         }
 
-        public string FormatFileSize(long bytes)
-        {
-            if (bytes == 0) return "0 B";
+        // ===== IFileService 接口的这3个方法，直接调用 helper =====
+        public string FormatFileSize(long bytes) => _fileSystemHelper.FormatFileSize(bytes);
+        public string GetMimeType(string extension) => _fileSystemHelper.GetMimeType(extension);
+        public string GetRootPath() => _fileSystemHelper.GetRootPath();
 
-            string[] sizes = { "B", "KB", "MB", "GB", "TB" };
-            int order = 0;
-            double len = bytes;
-            while (len >= 1024 && order < sizes.Length - 1)
-            {
-                order++;
-                len /= 1024;
-            }
-            return $"{len:0.##} {sizes[order]}";
-        }
-
-        public string GetMimeType(string extension)
-        {
-            var mimeTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                { ".txt", "text/plain" },
-                { ".html", "text/html" },
-                { ".htm", "text/html" },
-                { ".css", "text/css" },
-                { ".js", "application/javascript" },
-                { ".json", "application/json" },
-                { ".xml", "application/xml" },
-                { ".jpg", "image/jpeg" },
-                { ".jpeg", "image/jpeg" },
-                { ".png", "image/png" },
-                { ".gif", "image/gif" },
-                { ".bmp", "image/bmp" },
-                { ".webp", "image/webp" },
-                { ".mp3", "audio/mpeg" },
-                { ".wav", "audio/wav" },
-                { ".flac", "audio/flac" },
-                { ".aac", "audio/aac" },
-                { ".ogg", "audio/ogg" },
-                { ".mp4", "video/mp4" },
-                { ".avi", "video/x-msvideo" },
-                { ".mov", "video/quicktime" },
-                { ".mkv", "video/x-matroska" },
-                { ".wmv", "video/x-ms-wmv" },
-                { ".flv", "video/x-flv" },
-                { ".webm", "video/webm" },
-                { ".m4v", "video/mp4" },
-                { ".pdf", "application/pdf" },
-                { ".zip", "application/zip" },
-                { ".rar", "application/x-rar-compressed" },
-                { ".7z", "application/x-7z-compressed" },
-                { ".doc", "application/msword" },
-                { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
-                { ".xls", "application/vnd.ms-excel" },
-                { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
-                { ".ppt", "application/vnd.ms-powerpoint" },
-                { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
-                { ".md", "text/markdown" },
-                { ".csv", "text/csv" },
-                { ".yml", "text/yaml" },
-                { ".yaml", "text/yaml" },
-                { ".ini", "text/plain" },
-                { ".config", "text/xml" },
-                { ".sql", "application/sql" }
-            };
-
-            return mimeTypes.TryGetValue(extension, out string mimeType)
-                ? mimeType
-                : "application/octet-stream";
-        }
-
-        public string GetRootPath()
-        {
-            return _rootPath;
-        }
-
-        // ==================== 私有辅助 ====================
+        // ==================== 私有辅助方法 ====================
 
         private string GetParentPath(string currentPath)
         {
@@ -878,6 +497,60 @@ namespace FileServer.Services
                 return originalExtension;
             }
             return ".dat";
+        }
+
+        private async Task ValidateFileFormat(string filePath, string extension, string originalFileName)
+        {
+            try
+            {
+                if (extension == ".gif")
+                {
+                    await ValidateGifFile(filePath, originalFileName);
+                }
+                else if (IsImageFile(extension))
+                {
+                    await ValidateImageFile(filePath, originalFileName, extension);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "文件格式验证失败: {FileName}", originalFileName);
+            }
+        }
+
+        private async Task ValidateGifFile(string filePath, string originalFileName)
+        {
+            using var fileStream = File.OpenRead(filePath);
+            var buffer = new byte[6];
+            await fileStream.ReadAsync(buffer, 0, 6);
+
+            var header = Encoding.ASCII.GetString(buffer);
+            if (header == "GIF87a" || header == "GIF89a")
+            {
+                _logger.LogInformation("GIF 文件验证成功: {FileName}", originalFileName);
+            }
+            else
+            {
+                _logger.LogWarning("GIF 文件可能已损坏或格式不正确: {FileName} (头部: {Header})",
+                    originalFileName, header);
+            }
+        }
+
+        private async Task ValidateImageFile(string filePath, string originalFileName, string extension)
+        {
+            try
+            {
+                using var fileStream = File.OpenRead(filePath);
+                var buffer = new byte[8];
+                await fileStream.ReadAsync(buffer, 0, 8);
+
+                var hex = BitConverter.ToString(buffer).Replace("-", "");
+                _logger.LogDebug("图像文件 {FileName} 头部: {Header}", originalFileName, hex);
+            }
+            catch
+            {
+                // 忽略验证错误
+            }
         }
     }
 }

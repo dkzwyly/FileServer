@@ -7,8 +7,8 @@ using MetadataExtractor.Formats.Exif;
 using MetadataExtractor.Formats.Jpeg;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Directory = MetadataExtractor.Directory;   // EXIF 目录类
-using Dir = System.IO.Directory;                 // 文件系统目录类
+using Directory = MetadataExtractor.Directory;
+using Dir = System.IO.Directory;
 
 namespace FileServer.Services
 {
@@ -32,18 +32,15 @@ namespace FileServer.Services
             _logger = logger;
             _configuration = configuration;
 
-            // 从 fileService 获取根路径并转换为绝对路径
             var rawRoot = fileService.GetRootPath();
             _rootPath = Path.GetFullPath(rawRoot);
 
-            // LiteDB 数据库（使用独立配置键 PhotoLiteDbPath）
             var dbPath = configuration["FileServerConfig:PhotoLiteDbPath"];
             if (string.IsNullOrEmpty(dbPath))
                 dbPath = Path.Combine(_rootPath, "photo-metadata.db");
             else
                 dbPath = Path.GetFullPath(Path.Combine(_rootPath, dbPath));
 
-            // 确保数据库文件所在目录存在（使用 Dir 别名）
             var dbDir = Path.GetDirectoryName(dbPath);
             if (!string.IsNullOrEmpty(dbDir) && !Dir.Exists(dbDir))
                 Dir.CreateDirectory(dbDir);
@@ -98,18 +95,70 @@ namespace FileServer.Services
             }
         }
 
+        // 辅助方法：将 DateTime 截断到毫秒，并确保 Kind 为 UTC
+        private static DateTime TruncateToMillisecondUtc(DateTime dt)
+        {
+            if (dt.Kind != DateTimeKind.Utc)
+                dt = dt.ToUniversalTime();
+            return new DateTime(dt.Ticks / TimeSpan.TicksPerMillisecond * TimeSpan.TicksPerMillisecond, DateTimeKind.Utc);
+        }
+
+        // 获取 UTC 毫秒时间戳（long）
+        private static long ToUtcMilliseconds(DateTime dt)
+        {
+            if (dt.Kind != DateTimeKind.Utc)
+                dt = dt.ToUniversalTime();
+            return new DateTimeOffset(dt).ToUnixTimeMilliseconds();
+        }
+
+        // 标准化相对路径：统一使用 '/'，去除前导 '/'
+        private static string NormalizeRelativePath(string relativePath)
+        {
+            if (string.IsNullOrEmpty(relativePath))
+                return relativePath;
+
+            var normalized = relativePath.Replace('\\', '/');
+            if (normalized.StartsWith('/'))
+                normalized = normalized.TrimStart('/');
+            return normalized;
+        }
+
         public async Task<PhotoMetadata?> GetOrExtractMetadataAsync(string relativePath)
         {
+            relativePath = NormalizeRelativePath(relativePath);
+
             if (_cache.TryGetValue(relativePath, out var cached))
             {
                 var fullPath = Path.Combine(_rootPath, relativePath);
                 var fileInfo = new FileInfo(fullPath);
-                if (fileInfo.Exists && (fileInfo.Length != cached.FileSize || fileInfo.LastWriteTimeUtc != cached.LastModified))
+                if (fileInfo.Exists)
                 {
-                    _logger.LogInformation("文件已变更，重新提取: {Path}", relativePath);
-                    return await ExtractAndCacheAsync(relativePath);
+                    var fileModified = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc);
+                    var cachedModified = TruncateToMillisecondUtc(cached.LastModified);
+                    long fileTicks = ToUtcMilliseconds(fileModified);
+                    long cachedTicks = ToUtcMilliseconds(cachedModified);
+
+                    // 调试日志
+                    _logger.LogDebug(
+                        "比较: [{Path}] 文件时间={FileTime}({FileTicks}), 缓存时间={CacheTime}({CacheTicks})",
+                        relativePath, fileModified, fileTicks, cachedModified, cachedTicks);
+
+                    if (fileTicks != cachedTicks)
+                    {
+                        _logger.LogInformation(
+                            "文件修改时间变更，重新提取: {Path} (文件时间戳 {FileTicks} vs 缓存时间戳 {CacheTicks})",
+                            relativePath, fileTicks, cachedTicks);
+                        return await ExtractAndCacheAsync(relativePath);
+                    }
+                    return cached;
                 }
-                return cached;
+                else
+                {
+                    // 文件已被删除，清理缓存和数据库
+                    _cache.TryRemove(relativePath, out _);
+                    DeleteFromDatabase(relativePath);
+                    return null;
+                }
             }
 
             var dbDoc = _collection.FindById(relativePath);
@@ -127,9 +176,10 @@ namespace FileServer.Services
             var result = new Dictionary<string, PhotoMetadata>();
             foreach (var path in relativePaths)
             {
-                var meta = await GetOrExtractMetadataAsync(path);
+                var normalized = NormalizeRelativePath(path);
+                var meta = await GetOrExtractMetadataAsync(normalized);
                 if (meta != null)
-                    result[path] = meta;
+                    result[normalized] = meta;
             }
             return result;
         }
@@ -140,7 +190,7 @@ namespace FileServer.Services
 
             if (!string.IsNullOrEmpty(options.DirectoryPath))
             {
-                var dirPrefix = options.DirectoryPath.Replace('\\', '/');
+                var dirPrefix = NormalizeRelativePath(options.DirectoryPath);
                 if (!dirPrefix.EndsWith('/')) dirPrefix += '/';
                 query = query.Where(m => m.RelativePath.StartsWith(dirPrefix, StringComparison.OrdinalIgnoreCase));
             }
@@ -170,6 +220,7 @@ namespace FileServer.Services
 
         public async Task RefreshMetadataAsync(string relativePath)
         {
+            relativePath = NormalizeRelativePath(relativePath);
             _cache.TryRemove(relativePath, out _);
             DeleteFromDatabase(relativePath);
             await ExtractAndCacheAsync(relativePath);
@@ -196,13 +247,13 @@ namespace FileServer.Services
         private async Task ScanDirectoryIncrementallyAsync(string relativeDir, IProgress<string>? progress = null)
         {
             var fullDir = Path.Combine(_rootPath, relativeDir);
-            if (!Dir.Exists(fullDir))   // 使用别名 Dir
+            if (!Dir.Exists(fullDir))
             {
                 _logger.LogWarning("图片索引目录不存在: {Dir}", fullDir);
                 return;
             }
 
-            // 1. 获取磁盘文件信息（使用 Dir.GetFiles）
+            // 1. 获取磁盘文件信息
             var diskFiles = Dir.GetFiles(fullDir, "*.*", SearchOption.AllDirectories)
                 .Where(f => ImageExtensions.Contains(Path.GetExtension(f)))
                 .Select(f =>
@@ -211,7 +262,7 @@ namespace FileServer.Services
                     return new
                     {
                         Path = MakeRelativePath(f),
-                        LastWrite = fi.LastWriteTimeUtc,
+                        LastWrite = TruncateToMillisecondUtc(fi.LastWriteTimeUtc),
                         Size = fi.Length
                     };
                 })
@@ -219,13 +270,13 @@ namespace FileServer.Services
 
             _logger.LogInformation("扫描目录 [{Dir}]，发现 {Count} 个图片文件", relativeDir, diskFiles.Count);
 
-            // 2. 从数据库加载该目录下的记录（简化过滤，实际更严谨可用前缀匹配）
-            var dirPrefix = relativeDir.Replace('\\', '/');
+            // 2. 从数据库加载该目录下的记录
+            var dirPrefix = NormalizeRelativePath(relativeDir);
             if (!dirPrefix.EndsWith('/')) dirPrefix += '/';
             var dbRecords = _collection.Find(x => x.RelativePath.StartsWith(dirPrefix))
                                        .ToDictionary(m => m.RelativePath);
 
-            // 3. 分类变化
+            // 3. 分类变化（仅比较修改时间戳）
             var toAdd = new List<string>();
             var toUpdate = new List<string>();
             var toDelete = new List<string>();
@@ -235,7 +286,9 @@ namespace FileServer.Services
             {
                 if (dbRecords.TryGetValue(diskFile.Path, out var existing))
                 {
-                    if (existing.LastModified != diskFile.LastWrite || existing.FileSize != diskFile.Size)
+                    long diskTime = ToUtcMilliseconds(diskFile.LastWrite);
+                    long dbTime = ToUtcMilliseconds(existing.LastModified);
+                    if (diskTime != dbTime)
                         toUpdate.Add(diskFile.Path);
                 }
                 else
@@ -290,6 +343,7 @@ namespace FileServer.Services
 
         public async Task<bool> DeleteMetadataAsync(string relativePath)
         {
+            relativePath = NormalizeRelativePath(relativePath);
             try
             {
                 if (_cache.TryRemove(relativePath, out _))
@@ -307,8 +361,14 @@ namespace FileServer.Services
             }
         }
 
+        public Task<bool> IsEmptyAsync()
+        {
+            return Task.FromResult(_collection.Count() == 0);
+        }
+
         private async Task<PhotoMetadata?> ExtractAndCacheAsync(string relativePath)
         {
+            relativePath = NormalizeRelativePath(relativePath);
             var fullPath = Path.Combine(_rootPath, relativePath);
             if (!File.Exists(fullPath))
                 return null;
@@ -377,15 +437,15 @@ namespace FileServer.Services
                 {
                     RelativePath = relativePath,
                     FileName = Path.GetFileName(relativePath),
-                    DateTaken = dateTaken,
+                    DateTaken = dateTaken.HasValue ? TruncateToMillisecondUtc(dateTaken.Value) : null,
                     Latitude = lat,
                     Longitude = lng,
                     CameraModel = cameraModel,
                     Width = width,
                     Height = height,
                     FileSize = fileInfo.Length,
-                    LastModified = fileInfo.LastWriteTimeUtc,
-                    LastMetadataUpdate = DateTime.UtcNow
+                    LastModified = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc),
+                    LastMetadataUpdate = TruncateToMillisecondUtc(DateTime.UtcNow)
                 };
 
                 _cache.AddOrUpdate(relativePath, metadata, (_, _) => metadata);
@@ -405,7 +465,7 @@ namespace FileServer.Services
         {
             var root = _rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             var relative = fullPath.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            return relative.Replace('\\', '/');
+            return NormalizeRelativePath(relative);
         }
 
         public void Dispose()

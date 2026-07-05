@@ -1,6 +1,11 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileServer.Services;
 
@@ -17,9 +22,8 @@ public class AudioMetadataHostedService : IHostedService
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("AudioMetadataHostedService 启动，将在后台触发音乐增量索引...");
+        _logger.LogInformation("AudioMetadataHostedService 启动，检查数据库状态...");
 
-        // 后台执行，不阻塞启动
         _ = Task.Run(async () =>
         {
             try
@@ -28,18 +32,29 @@ public class AudioMetadataHostedService : IHostedService
                 var audioService = scope.ServiceProvider.GetRequiredService<IAudioMetadataService>();
                 var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
 
-                var rootPath = config.GetValue<string>("FileServerConfig:RootPath")!;
-                var audioDir = config.GetValue<string>("FileServerConfig:AudioIndexDirectory");
-                if (string.IsNullOrEmpty(audioDir))
-                    throw new InvalidOperationException("配置缺少 FileServerConfig:AudioIndexDirectory");
+                var isEmpty = await audioService.IsEmptyAsync();
 
-                var musicRoot = Path.Combine(rootPath, audioDir);
-                await audioService.ScanAndIndexAllAsync(musicRoot);
-                _logger.LogInformation("音乐元数据后台增量索引完成");
+                if (isEmpty)
+                {
+                    _logger.LogInformation("数据库为空，执行全量索引...");
+
+                    var rootPath = config.GetValue<string>("FileServerConfig:RootPath")!;
+                    var audioDir = config.GetValue<string>("FileServerConfig:AudioIndexDirectory");
+                    if (string.IsNullOrEmpty(audioDir))
+                        throw new InvalidOperationException("配置缺少 FileServerConfig:AudioIndexDirectory");
+
+                    var musicRoot = Path.Combine(rootPath, audioDir);
+                    await audioService.ScanAndIndexAllAsync(musicRoot);
+                    _logger.LogInformation("全量索引完成");
+                }
+                else
+                {
+                    _logger.LogInformation("数据库已有数据，跳过全量扫描，按需更新（访问文件时自动检查变动）。");
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "AudioMetadataHostedService 后台索引执行失败");
+                _logger.LogError(ex, "AudioMetadataHostedService 启动检查或索引执行失败");
             }
         }, cancellationToken);
 

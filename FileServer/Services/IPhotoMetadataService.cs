@@ -11,7 +11,10 @@ namespace FileServer.Services
         Task ScanAndIndexAllPhotosAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default);
         Task ScanConfiguredDirectoriesAsync();
 
-        // 新增：删除指定图片的元数据（同时清理内存缓存和数据库）
+        // 删除指定图片的元数据（同时清理内存缓存和数据库）
         Task<bool> DeleteMetadataAsync(string relativePath);
+
+        // 新增：检查数据库是否为空
+        Task<bool> IsEmptyAsync();
     }
 }
