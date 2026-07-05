@@ -568,6 +568,29 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "删除文件失败", message = ex.Message });
             }
         }
+        [HttpDelete("directory/{*path}")]
+        public async Task<IActionResult> DeleteDirectory(string path)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                path = WebUtility.UrlDecode(path);
+                var result = await _fileService.DeleteDirectoryAsync(path);
+                if (result)
+                    return Ok(new { success = true, message = "文件夹删除成功" });
+                else
+                    return NotFound(new { error = "文件夹不存在或删除失败" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除文件夹失败: {Path}", path);
+                return StatusCode(500, new { error = "删除文件夹失败", message = ex.Message });
+            }
+        }
 
         [HttpGet("stream/{*path}")]
         public async Task<IActionResult> StreamFile(string path)

@@ -552,5 +552,69 @@ namespace FileServer.Services
                 // 忽略验证错误
             }
         }
+        public async Task<bool> DeleteDirectoryAsync(string relativePath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(relativePath))
+                    throw new InvalidOperationException("不能删除根目录");
+
+                var rootPath = _fileSystemHelper.GetRootPath();
+                var physicalPath = Path.Combine(rootPath, relativePath);
+
+                if (!Directory.Exists(physicalPath))
+                    return false;
+
+                // ----- 1. 先遍历所有文件，清理相关元数据（在物理删除前） -----
+                var allFiles = Directory.GetFiles(physicalPath, "*", SearchOption.AllDirectories);
+                _logger.LogInformation("准备删除文件夹 {RelativePath}，包含 {FileCount} 个文件",
+                    relativePath, allFiles.Length);
+
+                foreach (var filePath in allFiles)
+                {
+                    // 计算相对路径（用于元数据服务）
+                    var relativeFilePath = Path.GetRelativePath(rootPath, filePath).Replace('\\', '/');
+                    var extension = Path.GetExtension(filePath).ToLowerInvariant();
+
+                    try
+                    {
+                        // 图片元数据清理
+                        if (IsImageFile(extension))
+                        {
+                            // 删除缩略图（如果有）
+                            await _thumbnailService.DeleteThumbnailAsync(relativeFilePath);
+                            // 如果有 PhotoMetadataService，则删除其索引
+                            // await _photoMetadataService.DeleteMetadataAsync(relativeFilePath);
+                        }
+                        // 音频元数据清理
+                        else if (IsAudioFile(extension))
+                        {
+                            // await _audioMetadataService.DeleteMetadataMappingAsync(filePath);
+                        }
+                        // 其他可能的索引清理...
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "清理文件元数据失败: {FilePath}", relativeFilePath);
+                        // 继续删除，不中断
+                    }
+                }
+
+                // ----- 2. 递归删除物理文件夹（包含所有子文件和子目录） -----
+                Directory.Delete(physicalPath, true);
+
+                // ----- 3. 从树缓存中移除节点（应递归删除所有子节点） -----
+                await _treeCache.RemoveNodeAsync(relativePath);
+
+                _logger.LogInformation("删除文件夹成功: {RelativePath}，共删除 {FileCount} 个文件",
+                    relativePath, allFiles.Length);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "删除文件夹失败: {RelativePath}", relativePath);
+                return false;
+            }
+        }
     }
 }

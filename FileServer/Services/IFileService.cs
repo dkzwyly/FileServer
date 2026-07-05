@@ -17,5 +17,11 @@ namespace FileServer.Services
         Task<bool> DeleteFileAsync(string filePath);
         Task<(Stream Stream, string ContentType, string FileName)> GetThumbnailAsync(string filePath);
         Task CreateDirectoryAsync(string relativePath);  // 新增
+        /// <summary>
+        /// 递归删除指定路径的文件夹及其所有内容（包括子文件夹和文件）
+        /// </summary>
+        /// <param name="relativePath">相对于根目录的路径</param>
+        /// <returns>是否删除成功</returns>
+        Task<bool> DeleteDirectoryAsync(string relativePath);
     }
 }
