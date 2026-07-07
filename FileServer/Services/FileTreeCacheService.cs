@@ -14,8 +14,10 @@ namespace FileServer.Services
         private int _changeCount = 0;
         private readonly ReaderWriterLockSlim _rwLock = new();
         private readonly string _dbPath;
+        private readonly string _connectionString;
         private readonly ILogger<FileTreeCacheService> _logger;
         private readonly IFileSystemHelper _fileSystemHelper;
+        private readonly BsonMapper _mapper;
 
         public FileTreeCacheService(
             ILogger<FileTreeCacheService> logger,
@@ -32,7 +34,12 @@ namespace FileServer.Services
                 Directory.CreateDirectory(fullMetadataDir);
 
             _dbPath = Path.Combine(fullMetadataDir, "file-tree.db");
+            _connectionString = $"Filename={_dbPath};Connection=Shared";
             _logger.LogInformation($"文件树缓存数据库路径: {_dbPath}");
+
+            // 配置 BsonMapper，明确 Path 为 Id
+            _mapper = new BsonMapper();
+            _mapper.Entity<FileNode>().Id(x => x.Path);
 
             _ = Task.Run(async () => await LoadAllFromDatabaseAsync());
         }
@@ -45,9 +52,8 @@ namespace FileServer.Services
             {
                 try
                 {
-                    // 先尝试加载数据库
                     List<FileNode> dbNodes = null;
-                    using (var db = new LiteDatabase(_dbPath))
+                    using (var db = new LiteDatabase(_connectionString, _mapper))
                     {
                         var col = db.GetCollection<FileNode>("nodes");
                         dbNodes = col.FindAll().ToList();
@@ -79,19 +85,17 @@ namespace FileServer.Services
                         _rwLock.ExitWriteLock();
                     }
 
-                    // 如果数据库为空（或加载失败导致节点数为0），执行全量扫描并一次性写入
                     if (_nodes.Count == 0)
                     {
                         _logger.LogInformation("数据库为空或未加载到节点，开始全量扫描构建文件树...");
-                        await BuildFullTreeAsync();          // 构建完整树（不操作数据库）
-                        await FullSaveToDatabaseAsync();    // 一次性保存到数据库
+                        await BuildFullTreeAsync();
+                        await FullSaveToDatabaseAsync();
                         _logger.LogInformation($"全量扫描完成，共加载 {_nodes.Count} 个节点");
                     }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "从数据库加载文件树失败，将使用空缓存");
-                    // 发生异常时尝试扫描
                     try
                     {
                         await BuildFullTreeAsync();
@@ -121,7 +125,7 @@ namespace FileServer.Services
             var allChildren = new Dictionary<string, HashSet<string>>();
 
             var queue = new Queue<string>();
-            queue.Enqueue(""); // 根目录（空字符串）
+            queue.Enqueue("");
 
             int totalScanned = 0;
             while (queue.Count > 0)
@@ -134,7 +138,6 @@ namespace FileServer.Services
                 var dirInfo = new DirectoryInfo(physicalPath);
                 var diskLastWrite = dirInfo.LastWriteTimeUtc;
 
-                // 获取子项（忽略异常）
                 string[] subDirs, files;
                 try
                 {
@@ -147,7 +150,6 @@ namespace FileServer.Services
                     continue;
                 }
 
-                // 添加当前目录节点（除非是根目录）
                 if (!string.IsNullOrEmpty(current))
                 {
                     var dirNode = new FileNode
@@ -161,14 +163,12 @@ namespace FileServer.Services
                     };
                     allNodes.Add(dirNode);
 
-                    // 添加到父节点子列表
                     var parent = GetParentPath(current);
                     if (!allChildren.ContainsKey(parent))
                         allChildren[parent] = new HashSet<string>();
                     allChildren[parent].Add(current);
                 }
 
-                // 子目录入队
                 foreach (var dir in subDirs)
                 {
                     var dirName = Path.GetFileName(dir);
@@ -176,7 +176,6 @@ namespace FileServer.Services
                     queue.Enqueue(relativePath);
                 }
 
-                // 处理文件
                 foreach (var file in files)
                 {
                     var fileNode = CreateFileNode(current, file);
@@ -192,7 +191,6 @@ namespace FileServer.Services
                     _logger.LogDebug("全量扫描进度: 已扫描 {Count} 个目录", totalScanned);
             }
 
-            // 一次性替换缓存
             _rwLock.EnterWriteLock();
             try
             {
@@ -216,11 +214,8 @@ namespace FileServer.Services
             }
         }
 
-        // ---------- 以下所有公共接口保持不变（只修改了内部实现） ----------
-
         public async Task<FileListResponse> GetDirectoryContentAsync(string relativePath)
         {
-            // 规范化：空字符串表示根目录
             var normalized = (relativePath ?? "").Replace('\\', '/').Trim('/');
             if (normalized == "/") normalized = "";
 
@@ -378,7 +373,7 @@ namespace FileServer.Services
 
             try
             {
-                using var db = new LiteDatabase(_dbPath);
+                using var db = new LiteDatabase(_connectionString, _mapper);
                 var col = db.GetCollection<FileNode>("nodes");
                 col.EnsureIndex(x => x.ParentPath);
 
@@ -387,9 +382,18 @@ namespace FileServer.Services
                     try
                     {
                         if (entry.Type == ChangeType.Add)
+                        {
+                            if (string.IsNullOrEmpty(entry.Node?.Path))
+                            {
+                                _logger.LogWarning("跳过添加空 Path 的节点");
+                                continue;
+                            }
                             col.Insert(entry.Node);
+                        }
                         else
+                        {
                             col.Delete(entry.Path);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -429,14 +433,16 @@ namespace FileServer.Services
             {
                 try
                 {
-                    using var db = new LiteDatabase(_dbPath);
+                    using var db = new LiteDatabase(_connectionString, _mapper);
                     var col = db.GetCollection<FileNode>("nodes");
                     col.DeleteAll();
-                    col.InsertBulk(snapshot);
-                    _logger.LogInformation($"全量覆盖完成，共 {snapshot.Count} 个节点");
+                    var validNodes = snapshot.Where(n => !string.IsNullOrEmpty(n.Path)).ToList();
+                    if (validNodes.Count > 0)
+                        col.InsertBulk(validNodes);
+                    _logger.LogInformation($"全量覆盖完成，共 {validNodes.Count} 个节点（过滤了 {snapshot.Count - validNodes.Count} 个无效节点）");
                     _changes.Clear();
                     Interlocked.Exchange(ref _changeCount, 0);
-                    return; // 成功则退出
+                    return;
                 }
                 catch (IOException) when (retryCount < maxRetries - 1)
                 {

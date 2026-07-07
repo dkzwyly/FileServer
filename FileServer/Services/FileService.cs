@@ -297,11 +297,8 @@ namespace FileServer.Services
         {
             var rootPath = _fileSystemHelper.GetRootPath();
             var physicalPath = Path.Combine(rootPath, filePath);
-
             if (!File.Exists(physicalPath))
-            {
                 throw new FileNotFoundException($"文件不存在: {filePath}");
-            }
 
             var fileInfo = new FileInfo(physicalPath);
             var extension = Path.GetExtension(physicalPath).ToLowerInvariant();
@@ -312,11 +309,168 @@ namespace FileServer.Services
                 contentType = "video/x-ms-wmv";
             }
 
-            var stream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            // 修改点：使用 FileShare.Read | FileShare.Delete
+            var stream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
 
             _logger.LogInformation("文件下载: {FileName} (大小: {Size})", fileInfo.Name, _fileSystemHelper.FormatFileSize(fileInfo.Length));
 
             return await Task.FromResult((stream, contentType, fileInfo.Name));
+        }
+        public async Task<bool> RenameAsync(string oldPath, string newName)
+        {
+            if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newName))
+                throw new ArgumentException("路径和名称不能为空");
+
+            var root = _fileSystemHelper.GetRootPath();
+            var oldFull = Path.Combine(root, oldPath);
+            var dir = Path.GetDirectoryName(oldFull);
+            var newFull = Path.Combine(dir!, newName);
+
+            // 检查旧路径是否存在
+            if (!File.Exists(oldFull) && !Directory.Exists(oldFull))
+                return false;
+
+            // 检查新名称是否已被占用
+            if (File.Exists(newFull) || Directory.Exists(newFull))
+                throw new InvalidOperationException($"目标 '{newName}' 已存在");
+
+            try
+            {
+                // 执行重命名
+                if (File.Exists(oldFull))
+                    File.Move(oldFull, newFull);
+                else
+                    Directory.Move(oldFull, newFull);
+
+                // 更新缓存：移除旧节点，添加新节点
+                var oldRel = oldPath.Replace('\\', '/');
+                var newRel = Path.Combine(Path.GetDirectoryName(oldRel) ?? "", newName).Replace('\\', '/');
+
+                // 移除旧节点（会递归移除子节点）
+                await _treeCache.RemoveNodeAsync(oldRel);
+
+                // 重新扫描新路径所在目录以添加新节点（或手动构建节点）
+                // 简便做法：重新扫描该目录
+                var parent = Path.GetDirectoryName(newRel) ?? "";
+                await _treeCache.GetDirectoryContentAsync(parent); // 内部会触发扫描更新
+
+                _logger.LogInformation("重命名成功: {Old} -> {New}", oldPath, newRel);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "重命名失败: {Old} -> {NewName}", oldPath, newName);
+                throw;
+            }
+        }
+
+        public async Task<bool> MoveAsync(string sourcePath, string destPath)
+        {
+            if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(destPath))
+                throw new ArgumentException("源路径和目标路径不能为空");
+
+            var root = _fileSystemHelper.GetRootPath();
+            var srcFull = Path.Combine(root, sourcePath);
+            var dstFull = Path.Combine(root, destPath);
+
+            if (!File.Exists(srcFull) && !Directory.Exists(srcFull))
+                return false;
+
+            if (File.Exists(dstFull) || Directory.Exists(dstFull))
+                throw new InvalidOperationException($"目标路径 '{destPath}' 已存在");
+
+            // 确保目标目录存在
+            var dstDir = Path.GetDirectoryName(dstFull);
+            if (!Directory.Exists(dstDir))
+                Directory.CreateDirectory(dstDir);
+
+            try
+            {
+                // 移动
+                if (File.Exists(srcFull))
+                    File.Move(srcFull, dstFull);
+                else
+                    Directory.Move(srcFull, dstFull);
+
+                // 更新缓存
+                var srcRel = sourcePath.Replace('\\', '/');
+                var dstRel = destPath.Replace('\\', '/');
+
+                // 删除旧节点（及子树）
+                await _treeCache.RemoveNodeAsync(srcRel);
+                // 刷新目标父目录缓存
+                var parent = Path.GetDirectoryName(dstRel) ?? "";
+                await _treeCache.GetDirectoryContentAsync(parent);
+
+                _logger.LogInformation("移动成功: {Src} -> {Dst}", sourcePath, destPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "移动失败: {Src} -> {Dst}", sourcePath, destPath);
+                throw;
+            }
+        }
+
+        public async Task<bool> CopyAsync(string sourcePath, string destPath)
+        {
+            if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(destPath))
+                throw new ArgumentException("源路径和目标路径不能为空");
+
+            var root = _fileSystemHelper.GetRootPath();
+            var srcFull = Path.Combine(root, sourcePath);
+            var dstFull = Path.Combine(root, destPath);
+
+            if (!File.Exists(srcFull) && !Directory.Exists(srcFull))
+                return false;
+
+            if (File.Exists(dstFull) || Directory.Exists(dstFull))
+                throw new InvalidOperationException($"目标路径 '{destPath}' 已存在");
+
+            // 确保目标目录存在
+            var dstDir = Path.GetDirectoryName(dstFull);
+            if (!Directory.Exists(dstDir))
+                Directory.CreateDirectory(dstDir);
+
+            try
+            {
+                // 复制
+                if (File.Exists(srcFull))
+                    File.Copy(srcFull, dstFull);
+                else
+                    CopyDirectory(srcFull, dstFull); // 递归复制目录
+
+                // 更新缓存：刷新目标父目录
+                var dstRel = destPath.Replace('\\', '/');
+                var parent = Path.GetDirectoryName(dstRel) ?? "";
+                await _treeCache.GetDirectoryContentAsync(parent);
+
+                _logger.LogInformation("复制成功: {Src} -> {Dst}", sourcePath, destPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "复制失败: {Src} -> {Dst}", sourcePath, destPath);
+                throw;
+            }
+        }
+
+        // 辅助：递归复制目录
+        private void CopyDirectory(string sourceDir, string destDir)
+        {
+            Directory.CreateDirectory(destDir);
+
+            foreach (var file in Directory.GetFiles(sourceDir))
+            {
+                var destFile = Path.Combine(destDir, Path.GetFileName(file));
+                File.Copy(file, destFile);
+            }
+
+            foreach (var subDir in Directory.GetDirectories(sourceDir))
+            {
+                var destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
+                CopyDirectory(subDir, destSubDir);
+            }
         }
 
         public async Task<FileInfoModel> GetFileInfoAsync(string filePath)

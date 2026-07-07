@@ -101,7 +101,8 @@ namespace FileServer.Services
             {
                 try
                 {
-                    var fileStream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    // 修改：添加 FileShare.Delete
+                    var fileStream = new FileStream(physicalPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
                     return MemoryMappedFile.CreateFromFile(
                         fileStream,
                         null,

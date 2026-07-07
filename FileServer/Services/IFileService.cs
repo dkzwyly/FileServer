@@ -23,5 +23,19 @@ namespace FileServer.Services
         /// <param name="relativePath">相对于根目录的路径</param>
         /// <returns>是否删除成功</returns>
         Task<bool> DeleteDirectoryAsync(string relativePath);
+        /// <summary>
+        /// 重命名文件或文件夹（仅更改名称，不改变路径）
+        /// </summary>
+        Task<bool> RenameAsync(string oldPath, string newName);
+
+        /// <summary>
+        /// 移动文件或文件夹到新路径（可跨目录）
+        /// </summary>
+        Task<bool> MoveAsync(string sourcePath, string destPath);
+
+        /// <summary>
+        /// 复制文件或文件夹到新路径
+        /// </summary>
+        Task<bool> CopyAsync(string sourcePath, string destPath);
     }
 }

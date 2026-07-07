@@ -24,6 +24,11 @@ builder.Services.AddSingleton<IAudioMetadataService, AudioMetadataService>();
 builder.Services.AddSingleton<IPhotoMetadataService, PhotoMetadataService>();
 builder.Services.AddSingleton<ILyricsMappingService, LyricsMappingService>();
 builder.Services.AddSingleton<IFileTreeCacheService, FileTreeCacheService>();  // 依赖 IFileSystemHelper，无循环
+// 注册队列（单例）
+builder.Services.AddSingleton<IJobQueue, JobQueue>();
+
+// 注册后台服务（托管）
+builder.Services.AddHostedService<FileOperationBackgroundService>();
 
 // 4. 注册后台托管服务
 builder.Services.AddHostedService<FileTreeSaveService>();        // 每日5点增量同步

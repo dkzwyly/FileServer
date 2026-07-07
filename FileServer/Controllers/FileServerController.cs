@@ -1,10 +1,13 @@
 ﻿using FileServer.Models;
 using FileServer.Services;
+using LiteDB;
+using MetadataExtractor.Formats.Photoshop;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
 using System.IO.MemoryMappedFiles;
 using System.Net;
 using System.Text;
+
 
 namespace FileServer.Controllers
 {
@@ -25,17 +28,27 @@ namespace FileServer.Controllers
         private readonly IMemoryCache _memoryCache;
         private readonly ILyricsMappingService _lyricsMappingService;
 
-        public FileServerController(IFileService fileService,
-                                  IServerStatusService statusService,
-                                  ILogger<FileServerController> logger,
-                                  IConfiguration configuration,
-                                  IMemoryMappedFileService memoryMappedService,
-                                  IChapterIndexService chapterIndexService,
-                                  IVideoThumbnailService videoThumbnailService,
-                                  IAudioMetadataService audioMetadataService,
-                                  IMemoryCache memoryCache,
-                                  IPhotoMetadataService photoMetadataService,
-                                  ILyricsMappingService lyricsMappingService)
+        // 新增字段
+        private readonly IJobQueue _jobQueue;
+        private readonly IFileSystemHelper _fileSystemHelper;
+        private readonly string _jobsDbPath;
+        private readonly string _jobsConnectionString;
+
+
+        public FileServerController(
+        IFileService fileService,
+        IServerStatusService statusService,
+        ILogger<FileServerController> logger,
+        IConfiguration configuration,
+        IMemoryMappedFileService memoryMappedService,
+        IChapterIndexService chapterIndexService,
+        IVideoThumbnailService videoThumbnailService,
+        IAudioMetadataService audioMetadataService,
+        IMemoryCache memoryCache,
+        IPhotoMetadataService photoMetadataService,
+        ILyricsMappingService lyricsMappingService,
+        IJobQueue jobQueue,                    // 新增
+        IFileSystemHelper fileSystemHelper)    // 新增
         {
             _fileService = fileService;
             _statusService = statusService;
@@ -49,6 +62,19 @@ namespace FileServer.Controllers
             _photoMetadataService = photoMetadataService;
             _charactersPerPage = configuration.GetValue<int>("Preview:CharactersPerPage", 5000);
             _memoryCache = memoryCache;
+
+            // 新增赋值
+            _jobQueue = jobQueue;
+            _fileSystemHelper = fileSystemHelper;
+
+            // 计算任务数据库路径和连接字符串
+            var rootPath = _fileSystemHelper.GetRootPath();
+            var metadataDir = _configuration["FileServerConfig:MetadataDirectory"] ?? "系统文件";
+            var fullMetadataDir = System.IO.Path.Combine(rootPath, metadataDir);
+            if (!Directory.Exists(fullMetadataDir))
+                Directory.CreateDirectory(fullMetadataDir);
+            _jobsDbPath = System.IO.Path.Combine(fullMetadataDir, "file-jobs.db");
+            _jobsConnectionString = $"Filename={_jobsDbPath};Connection=Shared";
         }
 
         [HttpGet("status")]
@@ -635,6 +661,164 @@ namespace FileServer.Controllers
                 _statusService.DecrementConnections();
             }
         }
+        [HttpPost("rename")]
+        public async Task<IActionResult> Rename([FromQuery] string oldPath, [FromQuery] string newName)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                oldPath = WebUtility.UrlDecode(oldPath);
+                newName = WebUtility.UrlDecode(newName);
+                var result = await _fileService.RenameAsync(oldPath, newName);
+                if (result)
+                    return Ok(new { success = true, message = "重命名成功" });
+                else
+                    return NotFound(new { error = "源文件或文件夹不存在" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return BadRequest(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "重命名操作失败");
+                return StatusCode(500, new { error = "重命名失败", message = ex.Message });
+            }
+        }
+
+        [HttpPost("move")]
+        public IActionResult Move([FromQuery] string sourcePath, [FromQuery] string destPath)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                if (string.IsNullOrEmpty(sourcePath) || string.IsNullOrEmpty(destPath))
+                    return BadRequest(new { error = "源路径和目标路径不能为空" });
+
+                var root = _fileSystemHelper.GetRootPath();
+                var srcFull = System.IO.Path.Combine(root, sourcePath);
+                if (!System.IO.File.Exists(srcFull) && !System.IO.Directory.Exists(srcFull))
+                    return NotFound(new { error = "源文件或文件夹不存在" });
+
+                var dstFull = System.IO.Path.Combine(root, destPath);
+                if (System.IO.File.Exists(dstFull) || System.IO.Directory.Exists(dstFull))
+                    return BadRequest(new { error = $"目标路径 '{destPath}' 已存在" });
+
+                var job = new FileOperationJob
+                {
+                    Id = Guid.NewGuid(),
+                    SourcePath = sourcePath,
+                    DestPath = destPath,
+                    OperationType = "Move",
+                    Status = "Queued",
+                    QueueTime = DateTime.UtcNow
+                };
+
+                using var db = new LiteDatabase(_jobsConnectionString);
+                var col = db.GetCollection<FileOperationJob>("jobs");
+                col.Insert(job);
+
+                _jobQueue.Enqueue(job);
+
+                _logger.LogInformation("移动任务已入队: {JobId}, {Src} -> {Dst}", job.Id, sourcePath, destPath);
+
+                return Accepted(new
+                {
+                    taskId = job.Id,
+                    status = job.Status,
+                    message = "任务已加入队列，请轮询任务状态"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "移动任务入队失败");
+                return StatusCode(500, new { error = "入队失败", message = ex.Message });
+            }
+        }
+
+        [HttpPost("copy")]
+        public IActionResult Copy([FromQuery] string sourcePath, [FromQuery] string destPath)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                if (string.IsNullOrEmpty(sourcePath) || string.IsNullOrEmpty(destPath))
+                    return BadRequest(new { error = "源路径和目标路径不能为空" });
+
+                var root = _fileSystemHelper.GetRootPath();
+                var srcFull = System.IO.Path.Combine(root, sourcePath);
+                if (!System.IO.File.Exists(srcFull) && !System.IO.Directory.Exists(srcFull))
+                    return NotFound(new { error = "源文件或文件夹不存在" });
+
+                var dstFull = System.IO.Path.Combine(root, destPath);
+                if (System.IO.File.Exists(dstFull) || System.IO.Directory.Exists(dstFull))
+                    return BadRequest(new { error = $"目标路径 '{destPath}' 已存在" });
+
+                var job = new FileOperationJob
+                {
+                    Id = Guid.NewGuid(),
+                    SourcePath = sourcePath,
+                    DestPath = destPath,
+                    OperationType = "Copy",
+                    Status = "Queued",
+                    QueueTime = DateTime.UtcNow
+                };
+
+                using var db = new LiteDatabase(_jobsConnectionString);
+                var col = db.GetCollection<FileOperationJob>("jobs");
+                col.Insert(job);
+
+                _jobQueue.Enqueue(job);
+
+                _logger.LogInformation("复制任务已入队: {JobId}, {Src} -> {Dst}", job.Id, sourcePath, destPath);
+
+                return Accepted(new
+                {
+                    taskId = job.Id,
+                    status = job.Status,
+                    message = "任务已加入队列，请轮询任务状态"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "复制任务入队失败");
+                return StatusCode(500, new { error = "入队失败", message = ex.Message });
+            }
+        }
+
+        [HttpGet("task/{taskId}")]
+        public IActionResult GetTaskStatus(Guid taskId)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                using var db = new LiteDatabase(_jobsConnectionString);
+                var col = db.GetCollection<FileOperationJob>("jobs");
+                var job = col.FindById(taskId);
+
+                if (job == null)
+                    return NotFound(new { error = "任务不存在" });
+
+                return Ok(new
+                {
+                    taskId = job.Id,
+                    status = job.Status,
+                    progressPercent = job.ProgressPercent,
+                    errorMessage = job.ErrorMessage,
+                    queueTime = job.QueueTime,
+                    completeTime = job.CompleteTime
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "查询任务状态失败");
+                return StatusCode(500, new { error = "查询失败", message = ex.Message });
+            }
+        }
+
 
         #region 章节相关端点
 
