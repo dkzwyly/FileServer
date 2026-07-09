@@ -19,17 +19,23 @@ namespace FileServer.Services
         private readonly string _rootPath;
         private readonly LiteDatabase _db;
         private readonly ILiteCollection<PhotoMetadata> _collection;
+        private readonly IFileTreeCacheService _fileTreeCacheService;
 
-        private static readonly ConcurrentDictionary<string, PhotoMetadata> _cache = new();
+        // 内存缓存：以路径为键，方便快速获取
+        private static readonly ConcurrentDictionary<string, PhotoMetadata> _cacheByPath = new();
+
+        // 辅助映射：指纹 -> 路径（用于快速更新缓存）
+        private static readonly ConcurrentDictionary<string, string> _fingerprintToPath = new();
 
         public static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif", ".gif"
         };
 
-        public PhotoMetadataService(IFileService fileService, ILogger<PhotoMetadataService> logger, IConfiguration configuration)
+        public PhotoMetadataService(IFileService fileService, ILogger<PhotoMetadataService> logger, IFileTreeCacheService fileTreeCacheService, IConfiguration configuration)
         {
             _logger = logger;
+            _fileTreeCacheService = fileTreeCacheService;
             _configuration = configuration;
 
             var rawRoot = fileService.GetRootPath();
@@ -47,7 +53,10 @@ namespace FileServer.Services
 
             _db = new LiteDatabase(dbPath);
             _collection = _db.GetCollection<PhotoMetadata>("photoMetadata");
-            _collection.EnsureIndex(x => x.RelativePath, unique: true);
+            // 以 Fingerprint 作为唯一索引
+            _collection.EnsureIndex(x => x.Fingerprint, unique: true);
+            // 保留 RelativePath 索引用于搜索
+            _collection.EnsureIndex(x => x.RelativePath);
             _collection.EnsureIndex(x => x.DateTaken);
             _collection.EnsureIndex(x => x.Latitude);
             _collection.EnsureIndex(x => x.Longitude);
@@ -62,7 +71,11 @@ namespace FileServer.Services
             {
                 var all = _collection.FindAll().ToList();
                 foreach (var doc in all)
-                    _cache.TryAdd(doc.RelativePath, doc);
+                {
+                    _cacheByPath[doc.RelativePath] = doc;
+                    if (!string.IsNullOrEmpty(doc.Fingerprint))
+                        _fingerprintToPath[doc.Fingerprint] = doc.RelativePath;
+                }
             }
             catch (Exception ex)
             {
@@ -83,19 +96,18 @@ namespace FileServer.Services
             }
         }
 
-        private void DeleteFromDatabase(string relativePath)
+        private void DeleteFromDatabase(string fingerprint)
         {
             try
             {
-                _collection.Delete(relativePath);
+                _collection.DeleteMany(x => x.Fingerprint == fingerprint);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "从 LiteDB 删除图片元数据失败: {Path}", relativePath);
+                _logger.LogError(ex, "从 LiteDB 删除图片元数据失败: {Fingerprint}", fingerprint);
             }
         }
 
-        // 辅助方法：将 DateTime 截断到毫秒，并确保 Kind 为 UTC
         private static DateTime TruncateToMillisecondUtc(DateTime dt)
         {
             if (dt.Kind != DateTimeKind.Utc)
@@ -103,7 +115,6 @@ namespace FileServer.Services
             return new DateTime(dt.Ticks / TimeSpan.TicksPerMillisecond * TimeSpan.TicksPerMillisecond, DateTimeKind.Utc);
         }
 
-        // 获取 UTC 毫秒时间戳（long）
         private static long ToUtcMilliseconds(DateTime dt)
         {
             if (dt.Kind != DateTimeKind.Utc)
@@ -111,89 +122,185 @@ namespace FileServer.Services
             return new DateTimeOffset(dt).ToUnixTimeMilliseconds();
         }
 
-        // 标准化相对路径：统一使用 '/'，去除前导 '/'
         private static string NormalizeRelativePath(string relativePath)
         {
             if (string.IsNullOrEmpty(relativePath))
                 return relativePath;
-
             var normalized = relativePath.Replace('\\', '/');
             if (normalized.StartsWith('/'))
                 normalized = normalized.TrimStart('/');
             return normalized;
         }
 
+        // 计算指纹
+        private string ComputeFingerprint(long size, DateTime lastWriteUtc)
+        {
+            var ticks = lastWriteUtc.Ticks;
+            return $"{size}_{ticks}";
+        }
+
+        // ----- 实现 IPhotoMetadataService 接口 -----
+
+        public async Task<PhotoMetadata?> GetMetadataByFingerprintAsync(string fingerprint)
+        {
+            // 先从缓存找路径，再取元数据
+            if (_fingerprintToPath.TryGetValue(fingerprint, out var path))
+            {
+                if (_cacheByPath.TryGetValue(path, out var meta))
+                    return meta;
+            }
+            // 查数据库
+            var doc = _collection.FindOne(x => x.Fingerprint == fingerprint);
+            if (doc != null)
+            {
+                _cacheByPath[doc.RelativePath] = doc;
+                _fingerprintToPath[fingerprint] = doc.RelativePath;
+                return doc;
+            }
+            return null;
+        }
+
+        public async Task SaveMetadataByFingerprintAsync(string fingerprint, string path, PhotoMetadata metadata)
+        {
+            path = NormalizeRelativePath(path);
+            metadata.Fingerprint = fingerprint;
+            metadata.RelativePath = path;
+            metadata.LastMetadataUpdate = TruncateToMillisecondUtc(DateTime.UtcNow);
+            // 更新缓存
+            _cacheByPath[path] = metadata;
+            _fingerprintToPath[fingerprint] = path;
+            SaveToDatabase(metadata);
+            await Task.CompletedTask;
+        }
+
         public async Task<PhotoMetadata?> GetOrExtractMetadataAsync(string relativePath)
         {
             relativePath = NormalizeRelativePath(relativePath);
+            var fullPath = Path.Combine(_rootPath, relativePath);
+            if (!File.Exists(fullPath))
+                return null;
 
-            if (_cache.TryGetValue(relativePath, out var cached))
+            var fileInfo = new FileInfo(fullPath);
+            var size = fileInfo.Length;
+            var lastWrite = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc);
+            var fingerprint = ComputeFingerprint(size, lastWrite);
+
+            // 尝试从缓存/数据库获取
+            var existing = await GetMetadataByFingerprintAsync(fingerprint);
+            if (existing != null)
             {
-                var fullPath = Path.Combine(_rootPath, relativePath);
-                var fileInfo = new FileInfo(fullPath);
-                if (fileInfo.Exists)
+                // 如果路径不同，更新路径并保存
+                if (existing.RelativePath != relativePath)
                 {
-                    var fileModified = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc);
-                    var cachedModified = TruncateToMillisecondUtc(cached.LastModified);
-                    long fileTicks = ToUtcMilliseconds(fileModified);
-                    long cachedTicks = ToUtcMilliseconds(cachedModified);
-
-                    // 调试日志
-                    _logger.LogDebug(
-                        "比较: [{Path}] 文件时间={FileTime}({FileTicks}), 缓存时间={CacheTime}({CacheTicks})",
-                        relativePath, fileModified, fileTicks, cachedModified, cachedTicks);
-
-                    if (fileTicks != cachedTicks)
-                    {
-                        _logger.LogInformation(
-                            "文件修改时间变更，重新提取: {Path} (文件时间戳 {FileTicks} vs 缓存时间戳 {CacheTicks})",
-                            relativePath, fileTicks, cachedTicks);
-                        return await ExtractAndCacheAsync(relativePath);
-                    }
-                    return cached;
+                    // 移除旧路径缓存
+                    _cacheByPath.TryRemove(existing.RelativePath, out _);
+                    // 更新路径
+                    existing.RelativePath = relativePath;
+                    _cacheByPath[relativePath] = existing;
+                    _fingerprintToPath[fingerprint] = relativePath;
+                    SaveToDatabase(existing);
                 }
-                else
-                {
-                    // 文件已被删除，清理缓存和数据库
-                    _cache.TryRemove(relativePath, out _);
-                    DeleteFromDatabase(relativePath);
-                    return null;
-                }
+                return existing;
             }
 
-            var dbDoc = _collection.FindById(relativePath);
-            if (dbDoc != null)
-            {
-                _cache.TryAdd(relativePath, dbDoc);
-                return dbDoc;
-            }
-
-            return await ExtractAndCacheAsync(relativePath);
+            // 不存在则提取
+            var metadata = await ExtractAndCacheAsync(relativePath);
+            return metadata;
         }
 
         public async Task<Dictionary<string, PhotoMetadata>> GetBatchMetadataAsync(IEnumerable<string> relativePaths)
         {
             var result = new Dictionary<string, PhotoMetadata>();
-            foreach (var path in relativePaths)
+            var toProcess = new List<string>();
+            foreach (var rawPath in relativePaths)
             {
-                var normalized = NormalizeRelativePath(path);
-                var meta = await GetOrExtractMetadataAsync(normalized);
-                if (meta != null)
-                    result[normalized] = meta;
+                var path = NormalizeRelativePath(rawPath);
+                if (_cacheByPath.TryGetValue(path, out var cached))
+                {
+                    result[path] = cached;
+                }
+                else
+                {
+                    toProcess.Add(path);
+                }
             }
+
+            if (toProcess.Any())
+            {
+                // 计算所有文件的指纹并批量查询
+                var fingerprints = new List<string>();
+                var pathToFingerprint = new Dictionary<string, string>();
+                foreach (var path in toProcess)
+                {
+                    var fullPath = Path.Combine(_rootPath, path);
+                    if (File.Exists(fullPath))
+                    {
+                        var fi = new FileInfo(fullPath);
+                        var fp = ComputeFingerprint(fi.Length, TruncateToMillisecondUtc(fi.LastWriteTimeUtc));
+                        fingerprints.Add(fp);
+                        pathToFingerprint[path] = fp;
+                    }
+                }
+
+                var dbResults = _collection.Find(x => fingerprints.Contains(x.Fingerprint)).ToList();
+                foreach (var doc in dbResults)
+                {
+                    // 更新路径（如果数据库中的路径和当前请求路径不同，以当前请求为准）
+                    var currentPath = pathToFingerprint.FirstOrDefault(kv => kv.Value == doc.Fingerprint).Key;
+                    if (!string.IsNullOrEmpty(currentPath) && doc.RelativePath != currentPath)
+                    {
+                        doc.RelativePath = currentPath;
+                        SaveToDatabase(doc);
+                    }
+                    _cacheByPath[doc.RelativePath] = doc;
+                    _fingerprintToPath[doc.Fingerprint] = doc.RelativePath;
+                    result[doc.RelativePath] = doc;
+                }
+
+                // 对未在数据库中的文件进行提取
+                foreach (var path in toProcess)
+                {
+                    if (!result.ContainsKey(path))
+                    {
+                        var meta = await ExtractAndCacheAsync(path);
+                        if (meta != null)
+                            result[path] = meta;
+                    }
+                }
+            }
+
             return result;
         }
 
         public async Task<(IEnumerable<PhotoMetadata> Items, int TotalCount)> SearchPhotosAsync(PhotoSearchOptions options)
         {
-            var query = _cache.Values.AsQueryable();
-
+            // 1. 获取目标路径列表（从树缓存）
+            List<string> targetPaths = new List<string>();
             if (!string.IsNullOrEmpty(options.DirectoryPath))
             {
-                var dirPrefix = NormalizeRelativePath(options.DirectoryPath);
-                if (!dirPrefix.EndsWith('/')) dirPrefix += '/';
-                query = query.Where(m => m.RelativePath.StartsWith(dirPrefix, StringComparison.OrdinalIgnoreCase));
+                // 从树缓存获取所有文件路径（纯内存，或触发按需增量扫描）
+                var allPaths = await _fileTreeCacheService.GetAllFilePathsAsync(options.DirectoryPath);
+                // 只保留图片文件（按扩展名过滤）
+                targetPaths = allPaths
+                    .Where(p => ImageExtensions.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                    .ToList();
             }
+            else
+            {
+                // 未指定目录：可以选择从根目录获取所有，或抛出异常要求必须指定。
+                // 这里采用从根目录获取所有图片（若数据量极大可能耗时，但可接受）
+                var allPaths = await _fileTreeCacheService.GetAllFilePathsAsync("");
+                targetPaths = allPaths
+                    .Where(p => ImageExtensions.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+            }
+
+            // 2. 批量获取这些路径的元数据（内部会走缓存 + 数据库，不会触发磁盘提取除非文件从未索引过）
+            var metadataDict = await GetBatchMetadataAsync(targetPaths);
+
+            // 3. 内存过滤（日期、GPS）
+            var query = metadataDict.Values.AsQueryable();
+
             if (options.StartDate.HasValue)
                 query = query.Where(m => m.DateTaken >= options.StartDate.Value);
             if (options.EndDate.HasValue)
@@ -203,7 +310,7 @@ namespace FileServer.Services
             if (options.MinLongitude.HasValue && options.MaxLongitude.HasValue)
                 query = query.Where(m => m.Longitude >= options.MinLongitude && m.Longitude <= options.MaxLongitude);
 
-            var totalCount = query.Count();
+            // 4. 排序
             var sortBy = options.SortBy?.ToLowerInvariant() ?? "datetaken";
             var ordered = sortBy switch
             {
@@ -213,16 +320,28 @@ namespace FileServer.Services
                 _ => options.SortAscending ? query.OrderBy(m => m.DateTaken) : query.OrderByDescending(m => m.DateTaken),
             };
 
+            var totalCount = ordered.Count();
             var items = ordered.Skip(options.Skip).Take(options.Take).ToList();
-            await Task.CompletedTask;
+
+            // 注意：GetBatchMetadataAsync 已经更新了内存缓存，此处无需再手动更新
             return (items, totalCount);
         }
 
         public async Task RefreshMetadataAsync(string relativePath)
         {
             relativePath = NormalizeRelativePath(relativePath);
-            _cache.TryRemove(relativePath, out _);
-            DeleteFromDatabase(relativePath);
+            var fullPath = Path.Combine(_rootPath, relativePath);
+            if (!File.Exists(fullPath))
+                throw new FileNotFoundException($"文件不存在: {relativePath}");
+
+            // 先删除旧记录（按指纹）
+            var fi = new FileInfo(fullPath);
+            var fingerprint = ComputeFingerprint(fi.Length, TruncateToMillisecondUtc(fi.LastWriteTimeUtc));
+            // 移除缓存
+            _cacheByPath.TryRemove(relativePath, out _);
+            _fingerprintToPath.TryRemove(fingerprint, out _);
+            DeleteFromDatabase(fingerprint);
+
             await ExtractAndCacheAsync(relativePath);
         }
 
@@ -263,44 +382,48 @@ namespace FileServer.Services
                     {
                         Path = MakeRelativePath(f),
                         LastWrite = TruncateToMillisecondUtc(fi.LastWriteTimeUtc),
-                        Size = fi.Length
+                        Size = fi.Length,
+                        Fingerprint = ComputeFingerprint(fi.Length, TruncateToMillisecondUtc(fi.LastWriteTimeUtc))
                     };
                 })
                 .ToList();
 
             _logger.LogInformation("扫描目录 [{Dir}]，发现 {Count} 个图片文件", relativeDir, diskFiles.Count);
 
-            // 2. 从数据库加载该目录下的记录
+            // 2. 从数据库加载该目录下的记录（以指纹为键）
             var dirPrefix = NormalizeRelativePath(relativeDir);
             if (!dirPrefix.EndsWith('/')) dirPrefix += '/';
             var dbRecords = _collection.Find(x => x.RelativePath.StartsWith(dirPrefix))
-                                       .ToDictionary(m => m.RelativePath);
+                                       .ToDictionary(m => m.Fingerprint);
 
-            // 3. 分类变化（仅比较修改时间戳）
-            var toAdd = new List<string>();
-            var toUpdate = new List<string>();
-            var toDelete = new List<string>();
+            // 3. 分类变化
+            var toAdd = new List<string>();      // 指纹
+            var toUpdate = new List<string>();   // 指纹
+            var toDelete = new List<string>();   // 指纹
 
-            var diskPaths = new HashSet<string>(diskFiles.Select(f => f.Path));
+            var diskFingerprints = new HashSet<string>(diskFiles.Select(f => f.Fingerprint));
+            var diskPathByFingerprint = diskFiles.ToDictionary(f => f.Fingerprint, f => f.Path);
+
             foreach (var diskFile in diskFiles)
             {
-                if (dbRecords.TryGetValue(diskFile.Path, out var existing))
+                if (dbRecords.TryGetValue(diskFile.Fingerprint, out var existing))
                 {
-                    long diskTime = ToUtcMilliseconds(diskFile.LastWrite);
-                    long dbTime = ToUtcMilliseconds(existing.LastModified);
-                    if (diskTime != dbTime)
-                        toUpdate.Add(diskFile.Path);
+                    // 如果路径变了，更新路径
+                    if (existing.RelativePath != diskFile.Path)
+                        toUpdate.Add(diskFile.Fingerprint);
+                    // 如果修改时间变了，重新提取（但指纹包含了修改时间，所以指纹变了就是新文件）
+                    // 由于指纹包含了修改时间，如果文件内容变化，指纹会变，这里不会走到，因为指纹变了就是新文件
                 }
                 else
                 {
-                    toAdd.Add(diskFile.Path);
+                    toAdd.Add(diskFile.Fingerprint);
                 }
             }
 
-            foreach (var dbPath in dbRecords.Keys)
+            foreach (var dbFp in dbRecords.Keys)
             {
-                if (!diskPaths.Contains(dbPath))
-                    toDelete.Add(dbPath);
+                if (!diskFingerprints.Contains(dbFp))
+                    toDelete.Add(dbFp);
             }
 
             int totalChanges = toAdd.Count + toUpdate.Count + toDelete.Count;
@@ -314,27 +437,34 @@ namespace FileServer.Services
                 relativeDir, toAdd.Count, toUpdate.Count, toDelete.Count);
 
             // 4. 处理删除
-            foreach (var path in toDelete)
+            foreach (var fp in toDelete)
             {
-                _cache.TryRemove(path, out _);
-                DeleteFromDatabase(path);
+                if (_fingerprintToPath.TryGetValue(fp, out var path))
+                {
+                    _cacheByPath.TryRemove(path, out _);
+                    _fingerprintToPath.TryRemove(fp, out _);
+                }
+                DeleteFromDatabase(fp);
             }
 
             // 5. 处理新增和更新
             var toProcess = toAdd.Concat(toUpdate).ToList();
             int processed = 0;
-            foreach (var path in toProcess)
+            foreach (var fp in toProcess)
             {
-                try
+                if (diskPathByFingerprint.TryGetValue(fp, out var path))
                 {
-                    await ExtractAndCacheAsync(path);
-                    processed++;
-                    if (processed % 50 == 0)
-                        _logger.LogInformation("已处理 {Processed}/{Total} 张图片", processed, toProcess.Count);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "提取图片元数据失败: {Path}", path);
+                    try
+                    {
+                        await ExtractAndCacheAsync(path);
+                        processed++;
+                        if (processed % 50 == 0)
+                            _logger.LogInformation("已处理 {Processed}/{Total} 张图片", processed, toProcess.Count);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "提取图片元数据失败: {Path}", path);
+                    }
                 }
             }
 
@@ -344,21 +474,37 @@ namespace FileServer.Services
         public async Task<bool> DeleteMetadataAsync(string relativePath)
         {
             relativePath = NormalizeRelativePath(relativePath);
-            try
+            // 获取指纹
+            if (_cacheByPath.TryGetValue(relativePath, out var meta))
             {
-                if (_cache.TryRemove(relativePath, out _))
+                var fp = meta.Fingerprint;
+                _cacheByPath.TryRemove(relativePath, out _);
+                _fingerprintToPath.TryRemove(fp, out _);
+                DeleteFromDatabase(fp);
+                return true;
+            }
+            else
+            {
+                // 通过数据库查询
+                var doc = _collection.FindOne(x => x.RelativePath == relativePath);
+                if (doc != null)
                 {
-                    DeleteFromDatabase(relativePath);
-                    _logger.LogInformation("图片元数据已删除: {Path}", relativePath);
+                    DeleteFromDatabase(doc.Fingerprint);
                     return true;
                 }
-                return false;
             }
-            catch (Exception ex)
+            return false;
+        }
+
+        public async Task DeleteMetadataByFingerprintAsync(string fingerprint)
+        {
+            if (_fingerprintToPath.TryGetValue(fingerprint, out var path))
             {
-                _logger.LogError(ex, "删除图片元数据失败: {Path}", relativePath);
-                return false;
+                _cacheByPath.TryRemove(path, out _);
+                _fingerprintToPath.TryRemove(fingerprint, out _);
             }
+            DeleteFromDatabase(fingerprint);
+            await Task.CompletedTask;
         }
 
         public Task<bool> IsEmptyAsync()
@@ -433,8 +579,12 @@ namespace FileServer.Services
                 }
 
                 var fileInfo = new FileInfo(fullPath);
+                var lastWrite = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc);
+                var fingerprint = ComputeFingerprint(fileInfo.Length, lastWrite);
+
                 var metadata = new PhotoMetadata
                 {
+                    Fingerprint = fingerprint,
                     RelativePath = relativePath,
                     FileName = Path.GetFileName(relativePath),
                     DateTaken = dateTaken.HasValue ? TruncateToMillisecondUtc(dateTaken.Value) : null,
@@ -444,11 +594,13 @@ namespace FileServer.Services
                     Width = width,
                     Height = height,
                     FileSize = fileInfo.Length,
-                    LastModified = TruncateToMillisecondUtc(fileInfo.LastWriteTimeUtc),
+                    LastModified = lastWrite,
                     LastMetadataUpdate = TruncateToMillisecondUtc(DateTime.UtcNow)
                 };
 
-                _cache.AddOrUpdate(relativePath, metadata, (_, _) => metadata);
+                // 更新缓存
+                _cacheByPath[relativePath] = metadata;
+                _fingerprintToPath[fingerprint] = relativePath;
                 SaveToDatabase(metadata);
 
                 _logger.LogDebug("已提取并缓存: {Path}", relativePath);

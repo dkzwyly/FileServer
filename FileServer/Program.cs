@@ -26,6 +26,7 @@ builder.Services.AddSingleton<ILyricsMappingService, LyricsMappingService>();
 builder.Services.AddSingleton<IFileTreeCacheService, FileTreeCacheService>();  // 依赖 IFileSystemHelper，无循环
 // 注册队列（单例）
 builder.Services.AddSingleton<IJobQueue, JobQueue>();
+builder.Services.AddScoped<ITrashService, TrashService>();
 
 // 注册后台服务（托管）
 builder.Services.AddHostedService<FileOperationBackgroundService>();

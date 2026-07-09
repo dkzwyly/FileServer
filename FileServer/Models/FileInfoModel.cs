@@ -25,6 +25,7 @@
         public string Encoding { get; set; } = string.Empty;
         public bool HasThumbnail { get; set; }
         public PhotoMetadata? Metadata { get; set; }
+        public string Fingerprint => $"{Size}_{LastModified.Ticks}";
     }
 
     public class DirectoryInfoModel

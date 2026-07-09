@@ -18,5 +18,6 @@
 
   <ItemGroup>
     <Folder Include="ChapterIndexes\" />
+    <Folder Include="interfce\" />
   </ItemGroup>
 </Project>

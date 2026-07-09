@@ -4,17 +4,27 @@ namespace FileServer.Services
 {
     public interface IPhotoMetadataService
     {
+        // ----- 指纹主键操作 -----
+        Task<PhotoMetadata?> GetMetadataByFingerprintAsync(string fingerprint);
+        Task SaveMetadataByFingerprintAsync(string fingerprint, string path, PhotoMetadata metadata);
+
+        // ----- 常规操作 -----
         Task<PhotoMetadata?> GetOrExtractMetadataAsync(string relativePath);
         Task<Dictionary<string, PhotoMetadata>> GetBatchMetadataAsync(IEnumerable<string> relativePaths);
-        Task<(IEnumerable<PhotoMetadata> Items, int TotalCount)> SearchPhotosAsync(PhotoSearchOptions options);
         Task RefreshMetadataAsync(string relativePath);
+
+        // ----- 删除 -----
+        Task<bool> DeleteMetadataAsync(string relativePath);               // 按路径（兼容旧代码）
+        Task DeleteMetadataByFingerprintAsync(string fingerprint);         // 按指纹（清空回收站用）
+
+        // ----- 搜索 -----
+        Task<(IEnumerable<PhotoMetadata> Items, int TotalCount)> SearchPhotosAsync(PhotoSearchOptions options);
+
+        // ----- 扫描/索引 -----
         Task ScanAndIndexAllPhotosAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default);
         Task ScanConfiguredDirectoriesAsync();
 
-        // 删除指定图片的元数据（同时清理内存缓存和数据库）
-        Task<bool> DeleteMetadataAsync(string relativePath);
-
-        // 新增：检查数据库是否为空
+        // ----- 工具 -----
         Task<bool> IsEmptyAsync();
     }
 }

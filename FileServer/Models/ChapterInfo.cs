@@ -9,7 +9,12 @@
 
     public class ChapterIndex
     {
+        // ===== 新增：指纹作为唯一标识 =====
+        public string Fingerprint { get; set; } = string.Empty;
+
+        // 文件路径（仅用于展示，不作为主键）
         public string FilePath { get; set; } = string.Empty;
+
         public long FileSize { get; set; }
         public DateTime FileLastModified { get; set; }
         public DateTime IndexTime { get; set; }

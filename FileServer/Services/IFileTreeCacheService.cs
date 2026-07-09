@@ -33,5 +33,10 @@ namespace FileServer.Services
         /// 全量覆盖（可选，用于灾难恢复或每周校验），使用时请谨慎
         /// </summary>
         Task FullSaveToDatabaseAsync();
+        /// <summary>
+        /// 从内存缓存中获取指定目录下所有文件路径（递归），不访问磁盘。
+        /// 如果树缓存中该目录不存在或已过期，会触发增量扫描（访问磁盘）来修复缓存。
+        /// </summary>
+        Task<List<string>> GetAllFilePathsAsync(string relativePath);
     }
 }

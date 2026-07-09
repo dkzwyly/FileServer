@@ -458,7 +458,116 @@ namespace FileServer.Services
             }
             throw new IOException($"全量保存失败，重试 {maxRetries} 次后仍被占用");
         }
+        // FileTreeCacheService.cs 中的新增代码
 
+        public async Task<List<string>> GetAllFilePathsAsync(string relativePath)
+        {
+            var normalized = NormalizeRelativePath(relativePath);
+
+            // 确保该目录在缓存中是最新的（会触发按需增量扫描）
+            await EnsureDirectoryCachedAsync(normalized);
+
+            var result = new List<string>();
+            var queue = new Queue<string>();
+
+            _rwLock.EnterReadLock();
+            try
+            {
+                // 如果目录存在，将直接子节点入队
+                if (_children.TryGetValue(normalized, out var directChildren))
+                {
+                    foreach (var child in directChildren)
+                        queue.Enqueue(child);
+                }
+
+                // BFS 遍历（纯内存操作）
+                while (queue.Count > 0)
+                {
+                    var current = queue.Dequeue();
+                    if (_nodes.TryGetValue(current, out var node))
+                    {
+                        if (node.IsDirectory)
+                        {
+                            if (_children.TryGetValue(current, out var subChildren))
+                            {
+                                foreach (var sub in subChildren)
+                                    queue.Enqueue(sub);
+                            }
+                        }
+                        else
+                        {
+                            result.Add(current);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 确保指定目录在内存缓存中有效，如果不存在或已过期则触发增量扫描（访问磁盘）
+        /// </summary>
+        private async Task EnsureDirectoryCachedAsync(string relativePath)
+        {
+            bool needScan = false;
+            _rwLock.EnterReadLock();
+            try
+            {
+                if (_nodes.TryGetValue(relativePath, out var dirNode))
+                {
+                    var physicalPath = Path.Combine(_fileSystemHelper.GetRootPath(), relativePath);
+                    if (Directory.Exists(physicalPath))
+                    {
+                        var diskLastWrite = Directory.GetLastWriteTimeUtc(physicalPath);
+                        if (dirNode.LastModified != diskLastWrite)
+                        {
+                            needScan = true;
+                        }
+                        else
+                        {
+                            // 检查是否子节点为空但磁盘有内容（可能缓存缺失）
+                            bool hasChildren = _children.TryGetValue(relativePath, out var childSet) && childSet.Count > 0;
+                            if (!hasChildren)
+                            {
+                                if (Directory.EnumerateFileSystemEntries(physicalPath).Any())
+                                    needScan = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        needScan = true; // 目录在磁盘上已删除
+                    }
+                }
+                else
+                {
+                    needScan = true;
+                }
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+
+            if (needScan)
+            {
+                await ScanAndUpdateDirectoryAsync(relativePath);
+            }
+        }
+
+        // 已有的 NormalizeRelativePath 方法（确保存在）
+        private string NormalizeRelativePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            var normalized = path.Replace('\\', '/');
+            if (normalized.StartsWith('/')) normalized = normalized.TrimStart('/');
+            return normalized;
+        }
         // ---------- 私有辅助方法 ----------
 
         private FileListResponse BuildResponseFromCache(string path)
