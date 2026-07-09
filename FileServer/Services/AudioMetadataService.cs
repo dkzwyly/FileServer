@@ -1,14 +1,9 @@
-﻿using FileServer.Models;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using FileServer.Models;
 using LiteDB;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
 using TagLib;
 using SystemFile = System.IO.File;
 using TagFile = TagLib.File;
@@ -19,31 +14,33 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 {
     private readonly ILogger<AudioMetadataService> _logger;
     private readonly string _coversDirectory;
+    private readonly string _rootPath;
     private readonly LiteDatabase _db;
     private readonly ILiteCollection<SongMetadata> _collection;
-    private static readonly ConcurrentDictionary<string, SongMetadata> _cache = new();
+
+    // 内存缓存：路径 -> 元数据
+    private static readonly ConcurrentDictionary<string, SongMetadata> _cacheByPath = new();
+    // 辅助映射：指纹 -> 路径
+    private static readonly ConcurrentDictionary<string, string> _fingerprintToPath = new();
 
     public AudioMetadataService(ILogger<AudioMetadataService> logger, IConfiguration configuration)
     {
         _logger = logger;
 
-        // 读取根路径并转换为绝对路径
         var rootPath = configuration["FileServerConfig:RootPath"]
             ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
-        rootPath = Path.GetFullPath(rootPath);
+        _rootPath = Path.GetFullPath(rootPath);
 
-        // 封面目录
         var coversDir = configuration["FileServerConfig:CoversDirectory"] ?? "系统文件/covers";
-        _coversDirectory = Path.Combine(rootPath, coversDir);
+        _coversDirectory = Path.Combine(_rootPath, coversDir);
         if (!Directory.Exists(_coversDirectory))
             Directory.CreateDirectory(_coversDirectory);
 
-        // 数据库路径（优先使用绝对路径配置，否则基于 RootPath 组合）
         var dbPath = configuration["FileServerConfig:AudioLiteDbPath"];
         if (string.IsNullOrEmpty(dbPath))
-            dbPath = Path.Combine(rootPath, "audio-metadata.db");
+            dbPath = Path.Combine(_rootPath, "audio-metadata.db");
         else
-            dbPath = Path.GetFullPath(Path.Combine(rootPath, dbPath));
+            dbPath = Path.GetFullPath(Path.Combine(_rootPath, dbPath));
 
         var dbDir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dbDir) && !Directory.Exists(dbDir))
@@ -51,7 +48,10 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 
         _db = new LiteDatabase(dbPath);
         _collection = _db.GetCollection<SongMetadata>("songMetadata");
-        _collection.EnsureIndex(x => x.FilePath, unique: true);
+        // 以 Fingerprint 作为唯一索引
+        _collection.EnsureIndex(x => x.Fingerprint, unique: true);
+        // 保留 FilePath 索引用于搜索
+        _collection.EnsureIndex(x => x.FilePath);
 
         LoadFromDatabase();
         _logger.LogInformation("AudioMetadataService 初始化完成，数据库路径: {DbPath}", dbPath);
@@ -63,7 +63,11 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         {
             var all = _collection.FindAll().ToList();
             foreach (var doc in all)
-                _cache.TryAdd(doc.FilePath, doc);
+            {
+                _cacheByPath[doc.FilePath] = doc;
+                if (!string.IsNullOrEmpty(doc.Fingerprint))
+                    _fingerprintToPath[doc.Fingerprint] = doc.FilePath;
+            }
         }
         catch (Exception ex)
         {
@@ -84,77 +88,102 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         }
     }
 
-    private void DeleteFromDatabase(string filePath)
+    private void DeleteFromDatabase(string fingerprint)
     {
         try
         {
-            _collection.Delete(filePath);
+            _collection.DeleteMany(x => x.Fingerprint == fingerprint);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "从 LiteDB 删除失败: {FilePath}", filePath);
+            _logger.LogError(ex, "从 LiteDB 删除失败: {Fingerprint}", fingerprint);
         }
+    }
+
+    private string ComputeFingerprint(long size, DateTime lastWriteUtc)
+    {
+        return $"{size}_{lastWriteUtc.Ticks}";
+    }
+
+    // ----- 实现 IAudioMetadataService -----
+
+    public async Task<SongMetadata?> GetMetadataByFingerprintAsync(string fingerprint)
+    {
+        if (_fingerprintToPath.TryGetValue(fingerprint, out var path) && _cacheByPath.TryGetValue(path, out var cached))
+            return cached;
+        var doc = _collection.FindOne(x => x.Fingerprint == fingerprint);
+        if (doc != null)
+        {
+            _cacheByPath[doc.FilePath] = doc;
+            _fingerprintToPath[fingerprint] = doc.FilePath;
+            return doc;
+        }
+        return null;
+    }
+
+    public async Task SaveMetadataByFingerprintAsync(string fingerprint, string path, SongMetadata metadata)
+    {
+        metadata.Fingerprint = fingerprint;
+        metadata.FilePath = path;
+        metadata.LastModified = SystemFile.GetLastWriteTimeUtc(path);
+        _cacheByPath[path] = metadata;
+        _fingerprintToPath[fingerprint] = path;
+        SaveToDatabase(metadata);
+        await Task.CompletedTask;
     }
 
     public async Task<SongMetadata> GetMetadataAsync(string filePath)
     {
-        try
-        {
-            if (_cache.TryGetValue(filePath, out var cached))
-            {
-                if (SystemFile.Exists(filePath))
-                {
-                    var currentTime = SystemFile.GetLastWriteTimeUtc(filePath);
-                    if (cached.LastModified == currentTime)
-                    {
-                        _logger.LogDebug("从内存缓存命中: {Path}", filePath);
-                        return cached;
-                    }
-                }
-            }
-
-            var dbDoc = _collection.FindById(filePath);
-            if (dbDoc != null && SystemFile.Exists(filePath))
-            {
-                var currentTime = SystemFile.GetLastWriteTimeUtc(filePath);
-                if (dbDoc.LastModified == currentTime)
-                {
-                    _cache.AddOrUpdate(filePath, dbDoc, (_, _) => dbDoc);
-                    return dbDoc;
-                }
-            }
-
-            var metadata = await ExtractAndCacheAsync(filePath);
-            return metadata;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "读取音频元数据失败: {Path}", filePath);
+        if (!SystemFile.Exists(filePath))
             return FallbackMetadata(filePath);
+
+        var fi = new FileInfo(filePath);
+        var lastWrite = fi.LastWriteTimeUtc;
+        var fingerprint = ComputeFingerprint(fi.Length, lastWrite);
+
+        // 尝试通过指纹获取
+        var existing = await GetMetadataByFingerprintAsync(fingerprint);
+        if (existing != null)
+        {
+            // 如果路径不同，更新路径
+            if (existing.FilePath != filePath)
+            {
+                _cacheByPath.TryRemove(existing.FilePath, out _);
+                existing.FilePath = filePath;
+                _cacheByPath[filePath] = existing;
+                _fingerprintToPath[fingerprint] = filePath;
+                SaveToDatabase(existing);
+            }
+            return existing;
         }
+
+        // 不存在则提取
+        return await ExtractAndCacheAsync(filePath);
     }
 
     public async Task<SongMetadata?> GetMetadataMappingAsync(string songPath)
     {
-        _cache.TryGetValue(songPath, out var metadata);
-        return metadata;
+        _cacheByPath.TryGetValue(songPath, out var meta);
+        return meta;
     }
 
     public async Task<bool> SaveMetadataMappingAsync(string songPath, SongMetadata metadata)
     {
         try
         {
-            if (_cache.TryGetValue(songPath, out var existing) && !string.IsNullOrEmpty(existing.CustomCoverPath))
+            // 如果已经有自定义封面，保留
+            if (_cacheByPath.TryGetValue(songPath, out var existing) && !string.IsNullOrEmpty(existing.CustomCoverPath))
             {
-                if (string.IsNullOrEmpty(metadata.CustomCoverPath))
-                {
-                    metadata.CustomCoverPath = existing.CustomCoverPath;
-                    metadata.HasCover = true;
-                }
+                metadata.CustomCoverPath = existing.CustomCoverPath;
+                metadata.HasCover = true;
             }
-
+            // 计算指纹
+            var fi = new FileInfo(songPath);
+            var fingerprint = ComputeFingerprint(fi.Length, fi.LastWriteTimeUtc);
+            metadata.Fingerprint = fingerprint;
             metadata.FilePath = songPath;
-            _cache.AddOrUpdate(songPath, metadata, (_, _) => metadata);
+            _cacheByPath[songPath] = metadata;
+            _fingerprintToPath[fingerprint] = songPath;
             SaveToDatabase(metadata);
             return true;
         }
@@ -169,14 +198,34 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     {
         try
         {
-            if (_cache.TryRemove(songPath, out var removed) && !string.IsNullOrEmpty(removed.CustomCoverPath))
+            if (_cacheByPath.TryGetValue(songPath, out var meta))
             {
-                var coverFullPath = Path.Combine(_coversDirectory, removed.CustomCoverPath);
-                if (SystemFile.Exists(coverFullPath))
-                    SystemFile.Delete(coverFullPath);
+                var fp = meta.Fingerprint;
+                if (!string.IsNullOrEmpty(meta.CustomCoverPath))
+                {
+                    var coverFullPath = Path.Combine(_coversDirectory, meta.CustomCoverPath);
+                    if (SystemFile.Exists(coverFullPath))
+                        SystemFile.Delete(coverFullPath);
+                }
+                _cacheByPath.TryRemove(songPath, out _);
+                _fingerprintToPath.TryRemove(fp, out _);
+                DeleteFromDatabase(fp);
             }
-
-            DeleteFromDatabase(songPath);
+            else
+            {
+                // 通过数据库查找
+                var doc = _collection.FindOne(x => x.FilePath == songPath);
+                if (doc != null)
+                {
+                    if (!string.IsNullOrEmpty(doc.CustomCoverPath))
+                    {
+                        var coverFullPath = Path.Combine(_coversDirectory, doc.CustomCoverPath);
+                        if (SystemFile.Exists(coverFullPath))
+                            SystemFile.Delete(coverFullPath);
+                    }
+                    DeleteFromDatabase(doc.Fingerprint);
+                }
+            }
             return true;
         }
         catch (Exception ex)
@@ -186,11 +235,22 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         }
     }
 
+    public async Task DeleteMetadataByFingerprintAsync(string fingerprint)
+    {
+        if (_fingerprintToPath.TryGetValue(fingerprint, out var path))
+        {
+            _cacheByPath.TryRemove(path, out _);
+            _fingerprintToPath.TryRemove(fingerprint, out _);
+        }
+        DeleteFromDatabase(fingerprint);
+        await Task.CompletedTask;
+    }
+
     public async Task<Stream?> GetAlbumCoverAsync(string filePath)
     {
         try
         {
-            if (_cache.TryGetValue(filePath, out var metadata) && !string.IsNullOrEmpty(metadata.CustomCoverPath))
+            if (_cacheByPath.TryGetValue(filePath, out var metadata) && !string.IsNullOrEmpty(metadata.CustomCoverPath))
             {
                 var coverFullPath = Path.Combine(_coversDirectory, metadata.CustomCoverPath);
                 if (SystemFile.Exists(coverFullPath))
@@ -230,17 +290,11 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
                 await coverStream.CopyToAsync(fileStream);
             }
 
-            var metadata = _cache.GetOrAdd(songPath, _ => new SongMetadata
-            {
-                FilePath = songPath,
-                Title = Path.GetFileNameWithoutExtension(songPath),
-                Artist = "未知艺术家",
-                Album = "未知专辑",
-                HasCover = true
-            });
-            metadata.CustomCoverPath = safeFileName;
-            metadata.HasCover = true;
-            SaveToDatabase(metadata);
+            // 获取或创建元数据
+            var meta = await GetMetadataAsync(songPath);
+            meta.CustomCoverPath = safeFileName;
+            meta.HasCover = true;
+            await SaveMetadataMappingAsync(songPath, meta);
 
             _logger.LogInformation("保存自定义封面成功: {SongPath} -> {CoverPath}", songPath, safeFileName);
             return safeFileName;
@@ -256,7 +310,7 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     {
         try
         {
-            if (_cache.TryGetValue(songPath, out var metadata) && !string.IsNullOrEmpty(metadata.CustomCoverPath))
+            if (_cacheByPath.TryGetValue(songPath, out var metadata) && !string.IsNullOrEmpty(metadata.CustomCoverPath))
             {
                 var coverFullPath = Path.Combine(_coversDirectory, metadata.CustomCoverPath);
                 if (SystemFile.Exists(coverFullPath))
@@ -291,45 +345,42 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         };
 
         var diskFiles = Directory.GetFiles(musicDirectory, "*.*", SearchOption.AllDirectories)
-                                 .Where(f => audioExtensions.Contains(Path.GetExtension(f)))
-                                 .Select(f => new
-                                 {
-                                     Path = f,
-                                     LastWrite = SystemFile.GetLastWriteTimeUtc(f),
-                                     Size = new FileInfo(f).Length
-                                 })
-                                 .ToList();
+            .Where(f => audioExtensions.Contains(Path.GetExtension(f)))
+            .Select(f =>
+            {
+                var fi = new FileInfo(f);
+                return new
+                {
+                    Path = f,
+                    LastWrite = fi.LastWriteTimeUtc,
+                    Size = fi.Length,
+                    Fingerprint = ComputeFingerprint(fi.Length, fi.LastWriteTimeUtc)
+                };
+            })
+            .ToList();
 
         progress?.Report($"扫描到 {diskFiles.Count} 个音频文件，正在与数据库比对...");
         _logger.LogInformation("增量索引：磁盘文件数 {Count}", diskFiles.Count);
 
-        var dbRecords = _collection.FindAll().ToDictionary(m => m.FilePath);
+        var dbRecords = _collection.FindAll().ToDictionary(m => m.Fingerprint);
+        var diskFingerprints = new HashSet<string>(diskFiles.Select(f => f.Fingerprint));
+        var diskPathByFingerprint = diskFiles.ToDictionary(f => f.Fingerprint, f => f.Path);
 
         var toAdd = new List<string>();
-        var toUpdate = new List<string>();
         var toDelete = new List<string>();
 
-        foreach (var diskFile in diskFiles)
+        foreach (var fp in diskFingerprints)
         {
-            if (dbRecords.TryGetValue(diskFile.Path, out var existing))
-            {
-                if (existing.LastModified != diskFile.LastWrite)
-                    toUpdate.Add(diskFile.Path);
-            }
-            else
-            {
-                toAdd.Add(diskFile.Path);
-            }
+            if (!dbRecords.ContainsKey(fp))
+                toAdd.Add(fp);
+        }
+        foreach (var fp in dbRecords.Keys)
+        {
+            if (!diskFingerprints.Contains(fp))
+                toDelete.Add(fp);
         }
 
-        var diskPaths = new HashSet<string>(diskFiles.Select(f => f.Path));
-        foreach (var dbPath in dbRecords.Keys)
-        {
-            if (!diskPaths.Contains(dbPath))
-                toDelete.Add(dbPath);
-        }
-
-        int totalChanges = toAdd.Count + toUpdate.Count + toDelete.Count;
+        int totalChanges = toAdd.Count + toDelete.Count;
         if (totalChanges == 0)
         {
             progress?.Report("没有检测到任何变化，跳过索引。");
@@ -337,59 +388,65 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             return;
         }
 
-        progress?.Report($"检测到变化：新增 {toAdd.Count}，更新 {toUpdate.Count}，删除 {toDelete.Count}");
+        progress?.Report($"检测到变化：新增 {toAdd.Count}，删除 {toDelete.Count}");
 
-        foreach (var path in toDelete)
+        foreach (var fp in toDelete)
         {
-            if (_cache.TryRemove(path, out var removed))
+            if (_fingerprintToPath.TryGetValue(fp, out var path))
             {
-                if (!string.IsNullOrEmpty(removed.CustomCoverPath))
+                if (!string.IsNullOrEmpty(_cacheByPath[path]?.CustomCoverPath))
                 {
-                    var coverFullPath = Path.Combine(_coversDirectory, removed.CustomCoverPath);
+                    var coverFullPath = Path.Combine(_coversDirectory, _cacheByPath[path].CustomCoverPath);
                     if (SystemFile.Exists(coverFullPath))
                         SystemFile.Delete(coverFullPath);
                 }
-                DeleteFromDatabase(path);
+                _cacheByPath.TryRemove(path, out _);
+                _fingerprintToPath.TryRemove(fp, out _);
             }
+            DeleteFromDatabase(fp);
         }
 
-        var toProcess = toAdd.Concat(toUpdate).ToList();
         int processed = 0;
-        foreach (var path in toProcess)
+        foreach (var fp in toAdd)
         {
-            try
+            if (diskPathByFingerprint.TryGetValue(fp, out var path))
             {
-                await ExtractAndCacheAsync(path);
-                processed++;
-                if (processed % 10 == 0)
-                    progress?.Report($"索引进度: {processed}/{toProcess.Count}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "索引文件失败: {Path}", path);
+                try
+                {
+                    await ExtractAndCacheAsync(path);
+                    processed++;
+                    if (processed % 10 == 0)
+                        progress?.Report($"索引进度: {processed}/{toAdd.Count}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "索引文件失败: {Path}", path);
+                }
             }
         }
 
-        progress?.Report($"增量索引完成，成功处理 {processed}/{toProcess.Count} 个变化文件");
+        progress?.Report($"增量索引完成，成功处理 {processed}/{toAdd.Count} 个新增文件");
         _logger.LogInformation("增量索引完成，处理了 {Processed} 个文件，删除了 {Deleted} 个", processed, toDelete.Count);
     }
 
     private async Task<SongMetadata> ExtractAndCacheAsync(string filePath)
     {
         var metadata = ExtractMetadataFromFile(filePath);
+        var fi = new FileInfo(filePath);
+        var fingerprint = ComputeFingerprint(fi.Length, fi.LastWriteTimeUtc);
+        metadata.Fingerprint = fingerprint;
         metadata.FilePath = filePath;
-        metadata.LastModified = SystemFile.GetLastWriteTimeUtc(filePath);
+        metadata.LastModified = fi.LastWriteTimeUtc;
 
-        if (_cache.TryGetValue(filePath, out var old) && !string.IsNullOrEmpty(old.CustomCoverPath))
+        // 如果有旧的自定义封面，保留
+        if (_cacheByPath.TryGetValue(filePath, out var old) && !string.IsNullOrEmpty(old.CustomCoverPath))
         {
-            if (string.IsNullOrEmpty(metadata.CustomCoverPath))
-            {
-                metadata.CustomCoverPath = old.CustomCoverPath;
-                metadata.HasCover = true;
-            }
+            metadata.CustomCoverPath = old.CustomCoverPath;
+            metadata.HasCover = true;
         }
 
-        _cache.AddOrUpdate(filePath, metadata, (_, _) => metadata);
+        _cacheByPath[filePath] = metadata;
+        _fingerprintToPath[fingerprint] = filePath;
         SaveToDatabase(metadata);
         return metadata;
     }
@@ -426,9 +483,7 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             LastModified = null
         };
     }
-    /// <summary>
-    /// 批量获取元数据，优先从内存缓存返回，其次从 LiteDB 读取，避免逐文件磁盘检查。
-    /// </summary>
+
     public async Task<Dictionary<string, SongMetadata>> GetBatchMetadataAsync(List<string> paths)
     {
         var sw = Stopwatch.StartNew();
@@ -438,7 +493,7 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         // 1. 内存缓存
         foreach (var path in paths)
         {
-            if (_cache.TryGetValue(path, out var cached))
+            if (_cacheByPath.TryGetValue(path, out var cached))
                 result[path] = cached;
             else
                 missingPaths.Add(path);
@@ -446,27 +501,46 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
         _logger.LogInformation("Step1 Cache hit: {HitCount}, missing: {MissingCount}, elapsed: {Elapsed}ms",
             result.Count, missingPaths.Count, sw.ElapsedMilliseconds);
 
-        // 2. LiteDB 批量查询
+        // 2. 批量查询数据库（通过指纹）
         if (missingPaths.Any())
         {
             sw.Restart();
-            var bsonValues = missingPaths.Select(p => new BsonValue(p)).ToList();
-            var bsonArray = new BsonArray(bsonValues);
-            var dbResults = _collection.Find(Query.In("FilePath", bsonArray)).ToList();
+            var fingerprints = new List<string>();
+            var pathToFingerprint = new Dictionary<string, string>();
+            foreach (var path in missingPaths)
+            {
+                if (SystemFile.Exists(path))
+                {
+                    var fi = new FileInfo(path);
+                    var fp = ComputeFingerprint(fi.Length, fi.LastWriteTimeUtc);
+                    fingerprints.Add(fp);
+                    pathToFingerprint[path] = fp;
+                }
+            }
+
+            var dbResults = _collection.Find(x => fingerprints.Contains(x.Fingerprint)).ToList();
             _logger.LogInformation("Step2 LiteDB found: {DbCount}, elapsed: {Elapsed}ms",
                 dbResults.Count, sw.ElapsedMilliseconds);
 
             sw.Restart();
             foreach (var meta in dbResults)
             {
-                _cache.TryAdd(meta.FilePath, meta);
+                // 如果路径变了，更新
+                var currentPath = pathToFingerprint.FirstOrDefault(kv => kv.Value == meta.Fingerprint).Key;
+                if (!string.IsNullOrEmpty(currentPath) && meta.FilePath != currentPath)
+                {
+                    meta.FilePath = currentPath;
+                    SaveToDatabase(meta);
+                }
+                _cacheByPath[meta.FilePath] = meta;
+                _fingerprintToPath[meta.Fingerprint] = meta.FilePath;
                 result[meta.FilePath] = meta;
                 missingPaths.Remove(meta.FilePath);
             }
             _logger.LogInformation("Step2 update cache elapsed: {Elapsed}ms", sw.ElapsedMilliseconds);
         }
 
-        // 3. 实时提取（最昂贵）
+        // 3. 实时提取
         if (missingPaths.Any())
         {
             sw.Restart();
@@ -488,13 +562,12 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 
         return result;
     }
-    /// <summary>
-    /// 检查数据库是否为空（无任何元数据记录）
-    /// </summary>
+
     public Task<bool> IsEmptyAsync()
     {
         return Task.FromResult(_collection.Count() == 0);
     }
+
     public void Dispose()
     {
         _db?.Dispose();

@@ -27,6 +27,7 @@ namespace FileServer.Controllers
         private readonly int _charactersPerPage;
         private readonly IMemoryCache _memoryCache;
         private readonly ILyricsMappingService _lyricsMappingService;
+        private readonly ITrashService _trashService;
 
         // 新增字段
         private readonly IJobQueue _jobQueue;
@@ -47,7 +48,8 @@ namespace FileServer.Controllers
         IMemoryCache memoryCache,
         IPhotoMetadataService photoMetadataService,
         ILyricsMappingService lyricsMappingService,
-        IJobQueue jobQueue,                    // 新增
+        IJobQueue jobQueue,
+        ITrashService trashService,// 新增
         IFileSystemHelper fileSystemHelper)    // 新增
         {
             _fileService = fileService;
@@ -61,6 +63,7 @@ namespace FileServer.Controllers
             _audioMetadataService = audioMetadataService;
             _photoMetadataService = photoMetadataService;
             _charactersPerPage = configuration.GetValue<int>("Preview:CharactersPerPage", 5000);
+            _trashService = trashService;
             _memoryCache = memoryCache;
 
             // 新增赋值
@@ -545,55 +548,32 @@ namespace FileServer.Controllers
             try
             {
                 _statusService.IncrementRequests();
-
                 path = WebUtility.UrlDecode(path);
-                var result = await _fileService.DeleteFileAsync(path);
 
-                if (result)
-                {
-                    var extension = Path.GetExtension(path).ToLowerInvariant();
-
-                    // ----- 图片删除：清理元数据 -----
-                    if (IsImageFile(extension))
-                    {
-                        try
-                        {
-                            await _photoMetadataService.DeleteMetadataAsync(path);
-                            _logger.LogInformation("图片元数据已删除: {Path}", path);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "删除图片元数据失败: {Path}", path);
-                        }
-                    }
-                    // ----- 音频删除：清理元数据 -----
-                    else if (IsAudioFile(extension))
-                    {
-                        try
-                        {
-                            var fullPath = Path.Combine(_fileService.GetRootPath(), path);
-                            await _audioMetadataService.DeleteMetadataMappingAsync(fullPath);
-                            _logger.LogInformation("音频元数据已删除: {Path}", path);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "删除音频元数据失败: {Path}", path);
-                        }
-                    }
-
-                    return Ok(new { success = true, message = "文件删除成功" });
-                }
-                else
-                {
+                // 检查文件存在
+                if (!await _fileService.FileExistsAsync(path))
                     return NotFound(new { error = "文件不存在" });
-                }
+
+                // 移到回收站
+                var record = await _trashService.MoveToTrashAsync(path, false);
+
+                // 不再调用任何 DeleteMetadata
+                // 元数据保留
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "已移至回收站",
+                    trashRecordId = record.Id
+                });
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "删除文件失败: {Path}", path);
-                return StatusCode(500, new { error = "删除文件失败", message = ex.Message });
+                return StatusCode(500, new { error = ex.Message });
             }
         }
+
         [HttpDelete("directory/{*path}")]
         public async Task<IActionResult> DeleteDirectory(string path)
         {
@@ -601,20 +581,129 @@ namespace FileServer.Controllers
             {
                 _statusService.IncrementRequests();
                 path = WebUtility.UrlDecode(path);
-                var result = await _fileService.DeleteDirectoryAsync(path);
-                if (result)
-                    return Ok(new { success = true, message = "文件夹删除成功" });
-                else
-                    return NotFound(new { error = "文件夹不存在或删除失败" });
-            }
-            catch (InvalidOperationException ex)
-            {
-                return BadRequest(new { error = ex.Message });
+
+                if (path == "data" || path == "系统文件")
+                    return BadRequest(new { error = "不能删除系统根目录" });
+
+                // 检查目录存在
+                var root = _fileSystemHelper.GetRootPath();
+                var fullPath = Path.Combine(root, path);
+                if (!Directory.Exists(fullPath))
+                    return NotFound(new { error = "目录不存在" });
+
+                // 移到回收站
+                var record = await _trashService.MoveToTrashAsync(path, true);
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "目录已移至回收站",
+                    trashRecordId = record.Id
+                });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "删除文件夹失败: {Path}", path);
-                return StatusCode(500, new { error = "删除文件夹失败", message = ex.Message });
+                _logger.LogError(ex, "删除目录失败: {Path}", path);
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+        [HttpGet("trash/list")]
+        public async Task<IActionResult> GetTrashList()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                var records = await _trashService.GetAllRecordsAsync();
+
+                // 附加预览信息（可选）
+                var items = records.Select(r => new
+                {
+                    r.Id,
+                    r.OriginalPath,
+                    r.DeletedTime,
+                    r.IsDirectory,
+                    r.FileSize,
+                    r.Fingerprint
+                });
+
+                return Ok(new { total = items.Count(), items });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "获取回收站列表失败");
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        // ===== 新增：恢复回收站文件 =====
+        [HttpPost("trash/restore")]
+        public async Task<IActionResult> RestoreFromTrash(
+            [FromQuery] string recordId,
+            [FromQuery] string? targetDir = null)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                if (string.IsNullOrEmpty(recordId))
+                    return BadRequest(new { error = "记录ID不能为空" });
+
+                if (!string.IsNullOrEmpty(targetDir))
+                    targetDir = WebUtility.UrlDecode(targetDir);
+
+                var success = await _trashService.RestoreFromTrashAsync(recordId, targetDir);
+                if (success)
+                    return Ok(new { success = true, message = "恢复成功" });
+                else
+                    return NotFound(new { error = "恢复失败，记录不存在或文件已丢失" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "恢复失败: {RecordId}", recordId);
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        // ===== 新增：永久删除单个 =====
+        [HttpDelete("trash/permanent")]
+        public async Task<IActionResult> PermanentDelete([FromQuery] string recordId)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                if (string.IsNullOrEmpty(recordId))
+                    return BadRequest(new { error = "记录ID不能为空" });
+
+                var success = await _trashService.PermanentDeleteAsync(recordId);
+                if (success)
+                    return Ok(new { success = true, message = "已彻底删除" });
+                else
+                    return NotFound(new { error = "记录不存在" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "彻底删除失败: {RecordId}", recordId);
+                return StatusCode(500, new { error = ex.Message });
+            }
+        }
+
+        // ===== 新增：清空回收站 =====
+        [HttpDelete("trash/empty")]
+        public async Task<IActionResult> EmptyTrash()
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                var deletedCount = await _trashService.EmptyTrashAsync();
+                return Ok(new
+                {
+                    success = true,
+                    message = $"回收站已清空，共删除 {deletedCount} 个文件/目录"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "清空回收站失败");
+                return StatusCode(500, new { error = ex.Message });
             }
         }
 
@@ -837,6 +926,13 @@ namespace FileServer.Controllers
                 // 2. 如果缓存无效或不存在，才下载文件并构建索引
                 if (chapterIndex == null)
                 {
+                    // 获取文件指纹
+                    var fullPath = Path.Combine(_fileService.GetRootPath(), path);
+                    if (!System.IO.File.Exists(fullPath))
+                        return NotFound(new { error = "文件不存在" });
+                    var fi = new FileInfo(fullPath);
+                    var fingerprint = $"{fi.Length}_{fi.LastWriteTimeUtc.Ticks}";
+
                     // 下载文件内容
                     var (stream, contentType, fileName) = await _fileService.DownloadFileAsync(path);
                     using (stream)
@@ -854,8 +950,8 @@ namespace FileServer.Controllers
                         else
                             content = Encoding.UTF8.GetString(fileBytes);
 
-                        // 构建并保存索引
-                        chapterIndex = await _chapterIndexService.BuildChapterIndexAsync(path, content);
+                        // 构建并保存索引（传入指纹）
+                        chapterIndex = await _chapterIndexService.BuildChapterIndexAsync(path, content, fingerprint);
                     }
                 }
 
@@ -1753,8 +1849,15 @@ namespace FileServer.Controllers
                 songPath = WebUtility.UrlDecode(songPath);
                 _logger.LogInformation("获取歌词 - 歌曲路径: {SongPath}", songPath);
 
-                // 1. 首先查找映射的歌词文件
-                var mappedLyricsPath = await _lyricsMappingService.GetMappingAsync(songPath);
+                // 0. 获取歌曲指纹（用于歌词映射查询和保存）
+                var fullPath = Path.Combine(_fileService.GetRootPath(), songPath);
+                if (!System.IO.File.Exists(fullPath))
+                    return NotFound(new { error = "歌曲文件不存在" });
+                var fi = new FileInfo(fullPath);
+                var fingerprint = $"{fi.Length}_{fi.LastWriteTimeUtc.Ticks}";
+
+                // 1. 首先通过指纹查找映射的歌词文件
+                var mappedLyricsPath = await _lyricsMappingService.GetMappingByFingerprintAsync(fingerprint);
 
                 if (!string.IsNullOrEmpty(mappedLyricsPath))
                 {
@@ -1775,8 +1878,8 @@ namespace FileServer.Controllers
 
                 if (bestLyricsMatch != null && bestLyricsMatch.LyricsFile != null)
                 {
-                    // 找到匹配，自动保存映射（使用服务）
-                    await _lyricsMappingService.SaveMappingAsync(songPath, bestLyricsMatch.LyricsFile.Path);
+                    // 找到匹配，自动保存映射（使用指纹）
+                    await _lyricsMappingService.SaveMappingAsync(fingerprint, bestLyricsMatch.LyricsFile.Path);
 
                     _logger.LogInformation("智能匹配成功并建立映射: {SongPath} -> {LyricsPath}, 分数: {Score}",
                         songPath, bestLyricsMatch.LyricsFile.Path, bestLyricsMatch.MatchScore);
@@ -2108,7 +2211,15 @@ namespace FileServer.Controllers
                 songPath = WebUtility.UrlDecode(songPath);
                 _logger.LogInformation("获取歌词映射: {SongPath}", songPath);
 
-                var mappedLyricsPath = await _lyricsMappingService.GetMappingAsync(songPath);
+                // 1. 获取歌曲指纹
+                var fullPath = Path.Combine(_fileService.GetRootPath(), songPath);
+                if (!System.IO.File.Exists(fullPath))
+                    return NotFound(new { error = "歌曲文件不存在" });
+                var fi = new FileInfo(fullPath);
+                var fingerprint = $"{fi.Length}_{fi.LastWriteTimeUtc.Ticks}";
+
+                // 2. 通过指纹查询歌词映射
+                var mappedLyricsPath = await _lyricsMappingService.GetMappingByFingerprintAsync(fingerprint);
 
                 if (!string.IsNullOrEmpty(mappedLyricsPath))
                 {
@@ -2143,6 +2254,7 @@ namespace FileServer.Controllers
             }
         }
 
+
         [HttpDelete("lyrics/mapping/{*songPath}")]
         public async Task<IActionResult> DeleteLyricsMapping(string songPath)
         {
@@ -2153,7 +2265,8 @@ namespace FileServer.Controllers
                 songPath = WebUtility.UrlDecode(songPath);
                 _logger.LogInformation("删除歌词映射: {SongPath}", songPath);
 
-                var result = await _lyricsMappingService.DeleteMappingAsync(songPath);
+                // 使用基于路径的删除方法（内部会转为指纹）
+                var result = await _lyricsMappingService.DeleteMappingByPathAsync(songPath);
 
                 if (result)
                     return Ok(new { success = true, message = "歌词映射删除成功" });
@@ -2171,7 +2284,7 @@ namespace FileServer.Controllers
 
         #region 私有方法 - 歌词功能
 
-        
+
 
         private async Task<IActionResult> GetLyricsContent(string lyricsPath)
         {

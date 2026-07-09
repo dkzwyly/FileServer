@@ -2,26 +2,21 @@
 
 namespace FileServer.Services
 {
-    /// <summary>
-    /// 歌词映射服务（存储歌曲路径 ↔ 歌词文件路径 / "NO_LYRICS" 标记）
-    /// </summary>
     public interface ILyricsMappingService
     {
-        /// <summary>
-        /// 保存或更新歌词映射
-        /// </summary>
-        /// <param name="songPath">歌曲绝对路径（作为主键）</param>
-        /// <param name="lyricsPath">歌词文件路径，或特殊值 "NO_LYRICS"</param>
-        Task<bool> SaveMappingAsync(string songPath, string lyricsPath);
+        /// <summary>按指纹保存或更新歌词映射</summary>
+        Task<bool> SaveMappingAsync(string fingerprint, string lyricsPath);
 
-        /// <summary>
-        /// 获取歌词映射
-        /// </summary>
-        Task<string?> GetMappingAsync(string songPath);
+        /// <summary>按指纹获取歌词路径</summary>
+        Task<string?> GetMappingByFingerprintAsync(string fingerprint);
 
-        /// <summary>
-        /// 删除歌词映射
-        /// </summary>
-        Task<bool> DeleteMappingAsync(string songPath);
+        /// <summary>按歌曲路径获取歌词映射（内部转为指纹）</summary>
+        Task<string?> GetMappingByPathAsync(string songPath);
+
+        /// <summary>按指纹删除映射</summary>
+        Task<bool> DeleteMappingByFingerprintAsync(string fingerprint);
+
+        /// <summary>按路径删除映射（兼容旧调用）</summary>
+        Task<bool> DeleteMappingByPathAsync(string songPath);
     }
 }
