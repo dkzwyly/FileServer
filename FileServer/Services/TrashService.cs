@@ -15,6 +15,7 @@ namespace FileServer.Services
         private readonly IFileSystemHelper _fileSystemHelper;
         private readonly IPhotoMetadataService _photoMetadataService;
         private readonly IAudioMetadataService _audioMetadataService;
+        private readonly IFileTreeCacheService _treeCache;   // ← 新增
         private readonly ILogger<TrashService> _logger;
         private readonly LiteDatabase _db;
         private readonly ILiteCollection<TrashRecord> _collection;
@@ -24,12 +25,14 @@ namespace FileServer.Services
             IFileSystemHelper fileSystemHelper,
             IPhotoMetadataService photoMetadataService,
             IAudioMetadataService audioMetadataService,
+            IFileTreeCacheService treeCache,                 // ← 新增
             ILogger<TrashService> logger,
             IConfiguration configuration)
         {
             _fileSystemHelper = fileSystemHelper;
             _photoMetadataService = photoMetadataService;
             _audioMetadataService = audioMetadataService;
+            _treeCache = treeCache;                          // ← 新增
             _logger = logger;
 
             var rootPath = _fileSystemHelper.GetRootPath();
@@ -103,6 +106,9 @@ namespace FileServer.Services
             _collection.Insert(record);
             _logger.LogInformation("已移至回收站: {OriginalPath} -> {TrashPath}", relativePath, trashRelativePath);
 
+            // ===== 新增：刷新文件树缓存 =====
+            await RefreshTreeCacheAsync(relativePath, isDirectory, removeOnly: true);
+
             return record;
         }
 
@@ -121,7 +127,6 @@ namespace FileServer.Services
             string targetRelativePath;
             if (!string.IsNullOrEmpty(targetDir))
             {
-                // 用户指定目标目录
                 targetRelativePath = Path.Combine(targetDir, Path.GetFileName(record.OriginalPath));
             }
             else
@@ -158,7 +163,6 @@ namespace FileServer.Services
             // 更新元数据路径（如果指纹非空）
             if (!record.IsDirectory && !string.IsNullOrEmpty(record.Fingerprint))
             {
-                // 更新照片元数据
                 var photoMeta = await _photoMetadataService.GetMetadataByFingerprintAsync(record.Fingerprint);
                 if (photoMeta != null)
                 {
@@ -166,7 +170,6 @@ namespace FileServer.Services
                     await _photoMetadataService.SaveMetadataByFingerprintAsync(record.Fingerprint, targetRelativePath, photoMeta);
                 }
 
-                // 更新音频元数据
                 var audioMeta = await _audioMetadataService.GetMetadataByFingerprintAsync(record.Fingerprint);
                 if (audioMeta != null)
                 {
@@ -177,6 +180,10 @@ namespace FileServer.Services
 
             _collection.Delete(record.Id);
             _logger.LogInformation("恢复成功: {OriginalPath} -> {TargetPath}", record.OriginalPath, targetRelativePath);
+
+            // ===== 新增：刷新文件树缓存 =====
+            await RefreshTreeCacheAsync(targetRelativePath, record.IsDirectory, removeOnly: false);
+
             return true;
         }
 
@@ -202,13 +209,11 @@ namespace FileServer.Services
                 {
                     var trashFullPath = Path.Combine(_trashRoot, record.TrashPath);
 
-                    // 物理删除
                     if (record.IsDirectory && Directory.Exists(trashFullPath))
                         Directory.Delete(trashFullPath, true);
                     else if (!record.IsDirectory && File.Exists(trashFullPath))
                         File.Delete(trashFullPath);
 
-                    // 删除元数据
                     if (!record.IsDirectory && !string.IsNullOrEmpty(record.Fingerprint))
                     {
                         await _photoMetadataService.DeleteMetadataByFingerprintAsync(record.Fingerprint);
@@ -225,6 +230,7 @@ namespace FileServer.Services
                 }
             }
 
+            // 空回收站只影响 _trashRoot，不影响主存储树，无需刷新
             return deletedCount;
         }
 
@@ -249,6 +255,38 @@ namespace FileServer.Services
             _collection.Delete(record.Id);
             _logger.LogInformation("永久删除: {TrashPath}", record.TrashPath);
             return true;
+        }
+
+        // ===== 新增：统一的树缓存刷新 =====
+        /// <summary>
+        /// 刷新主存储树缓存。
+        /// removeOnly=true: 删除场景，先删节点，再刷新父目录
+        /// removeOnly=false: 恢复场景，直接刷新父目录（触发重新扫描）
+        /// </summary>
+        private async Task RefreshTreeCacheAsync(string relativePath, bool isDirectory, bool removeOnly)
+        {
+            try
+            {
+                var normalized = relativePath.Replace('\\', '/');
+
+                if (removeOnly)
+                {
+                    // 删除：先移除节点（如果是目录会递归移除子树）
+                    await _treeCache.RemoveNodeAsync(normalized);
+                }
+
+                // 刷新父目录缓存
+                var parent = Path.GetDirectoryName(normalized)?.Replace("\\", "/") ?? "";
+                await _treeCache.GetDirectoryContentAsync(parent);
+
+                _logger.LogInformation("树缓存已刷新: {Path} (removeOnly={RemoveOnly})",
+                    normalized, removeOnly);
+            }
+            catch (Exception ex)
+            {
+                // 刷新失败不应阻断业务，只记录日志
+                _logger.LogWarning(ex, "刷新树缓存失败: {Path}", relativePath);
+            }
         }
     }
 }
