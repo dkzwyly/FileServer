@@ -364,10 +364,15 @@ namespace FileServer.Services
             }
         }
 
-        public async Task<bool> MoveAsync(string sourcePath, string destPath)
+        public async Task<bool> MoveAsync(
+     string sourcePath,
+     string destPath,
+     CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(destPath))
                 throw new ArgumentException("源路径和目标路径不能为空");
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             var root = _fileSystemHelper.GetRootPath();
             var srcFull = Path.Combine(root, sourcePath);
@@ -379,31 +384,56 @@ namespace FileServer.Services
             if (File.Exists(dstFull) || Directory.Exists(dstFull))
                 throw new InvalidOperationException($"目标路径 '{destPath}' 已存在");
 
-            // 确保目标目录存在
             var dstDir = Path.GetDirectoryName(dstFull);
             if (!Directory.Exists(dstDir))
                 Directory.CreateDirectory(dstDir);
 
             try
             {
-                // 移动
-                if (File.Exists(srcFull))
-                    File.Move(srcFull, dstFull);
-                else
-                    Directory.Move(srcFull, dstFull);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // 尝试直接移动（同分区瞬时）
+                try
+                {
+                    if (File.Exists(srcFull))
+                        File.Move(srcFull, dstFull);
+                    else
+                        Directory.Move(srcFull, dstFull);
+                }
+                catch (IOException)
+                {
+                    // 跨分区：Copy + Delete
+                    _logger.LogInformation("移动跨分区，改用 复制+删除: {Src} -> {Dst}", sourcePath, destPath);
+
+                    if (File.Exists(srcFull))
+                    {
+                        var total = new FileInfo(srcFull).Length;
+                        await CopyFileWithProgressAsync(srcFull, dstFull, 0, total, null, cancellationToken);
+                        File.Delete(srcFull);
+                    }
+                    else
+                    {
+                        var total = CalculateDirectorySize(srcFull);
+                        var counter = new CopiedCounter();
+                        await CopyDirectoryWithProgressAsync(srcFull, dstFull, counter, total, null, cancellationToken);
+                        Directory.Delete(srcFull, true);
+                    }
+                }
 
                 // 更新缓存
                 var srcRel = sourcePath.Replace('\\', '/');
                 var dstRel = destPath.Replace('\\', '/');
-
-                // 删除旧节点（及子树）
                 await _treeCache.RemoveNodeAsync(srcRel);
-                // 刷新目标父目录缓存
                 var parent = Path.GetDirectoryName(dstRel) ?? "";
                 await _treeCache.GetDirectoryContentAsync(parent);
 
                 _logger.LogInformation("移动成功: {Src} -> {Dst}", sourcePath, destPath);
                 return true;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("移动已取消: {Src} -> {Dst}", sourcePath, destPath);
+                throw;
             }
             catch (Exception ex)
             {
@@ -412,10 +442,16 @@ namespace FileServer.Services
             }
         }
 
-        public async Task<bool> CopyAsync(string sourcePath, string destPath)
+        public async Task<bool> CopyAsync(
+            string sourcePath,
+            string destPath,
+            IProgress<FileOperationProgress> progress = null,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(destPath))
                 throw new ArgumentException("源路径和目标路径不能为空");
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             var root = _fileSystemHelper.GetRootPath();
             var srcFull = Path.Combine(root, sourcePath);
@@ -427,20 +463,27 @@ namespace FileServer.Services
             if (File.Exists(dstFull) || Directory.Exists(dstFull))
                 throw new InvalidOperationException($"目标路径 '{destPath}' 已存在");
 
-            // 确保目标目录存在
             var dstDir = Path.GetDirectoryName(dstFull);
             if (!Directory.Exists(dstDir))
                 Directory.CreateDirectory(dstDir);
 
             try
             {
-                // 复制
                 if (File.Exists(srcFull))
-                    File.Copy(srcFull, dstFull);
+                {
+                    var total = new FileInfo(srcFull).Length;
+                    progress?.Report(new FileOperationProgress(0, total));
+                    await CopyFileWithProgressAsync(srcFull, dstFull, 0, total, progress, cancellationToken);
+                }
                 else
-                    CopyDirectory(srcFull, dstFull); // 递归复制目录
+                {
+                    var total = CalculateDirectorySize(srcFull);
+                    progress?.Report(new FileOperationProgress(0, total));
+                    var counter = new CopiedCounter();
+                    await CopyDirectoryWithProgressAsync(srcFull, dstFull, counter, total, progress, cancellationToken);
+                }
 
-                // 更新缓存：刷新目标父目录
+                // 更新缓存
                 var dstRel = destPath.Replace('\\', '/');
                 var parent = Path.GetDirectoryName(dstRel) ?? "";
                 await _treeCache.GetDirectoryContentAsync(parent);
@@ -448,29 +491,94 @@ namespace FileServer.Services
                 _logger.LogInformation("复制成功: {Src} -> {Dst}", sourcePath, destPath);
                 return true;
             }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("复制已取消: {Src} -> {Dst}", sourcePath, destPath);
+                // 尽力清理已复制一半的目标
+                TryCleanupPartial(dstFull);
+                throw;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "复制失败: {Src} -> {Dst}", sourcePath, destPath);
+                TryCleanupPartial(dstFull);
                 throw;
             }
         }
 
-        // 辅助：递归复制目录
-        private void CopyDirectory(string sourceDir, string destDir)
+        // ===== 新增私有方法 =====
+
+        private long CalculateDirectorySize(string dir)
         {
-            Directory.CreateDirectory(destDir);
-
-            foreach (var file in Directory.GetFiles(sourceDir))
+            long total = 0;
+            try
             {
-                var destFile = Path.Combine(destDir, Path.GetFileName(file));
-                File.Copy(file, destFile);
+                foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                {
+                    try { total += new FileInfo(file).Length; } catch { }
+                }
+            }
+            catch { }
+            return total;
+        }
+
+        private async Task CopyDirectoryWithProgressAsync(
+    string srcDir, string dstDir,
+    CopiedCounter counter, long totalBytes,
+    IProgress<FileOperationProgress> progress,
+    CancellationToken ct)
+        {
+            Directory.CreateDirectory(dstDir);
+
+            foreach (var file in Directory.EnumerateFiles(srcDir))
+            {
+                ct.ThrowIfCancellationRequested();
+                var destFile = Path.Combine(dstDir, Path.GetFileName(file));
+                long fileSize = new FileInfo(file).Length;
+                await CopyFileWithProgressAsync(file, destFile, counter.Value, totalBytes, progress, ct);
+                counter.Value += fileSize;
             }
 
-            foreach (var subDir in Directory.GetDirectories(sourceDir))
+            foreach (var subDir in Directory.EnumerateDirectories(srcDir))
             {
-                var destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
-                CopyDirectory(subDir, destSubDir);
+                ct.ThrowIfCancellationRequested();
+                var destSub = Path.Combine(dstDir, Path.GetFileName(subDir));
+                await CopyDirectoryWithProgressAsync(subDir, destSub, counter, totalBytes, progress, ct);
             }
+        }
+
+        private async Task CopyFileWithProgressAsync(
+            string src, string dst,
+            long offsetBytes, long totalBytes,
+            IProgress<FileOperationProgress> progress,
+            CancellationToken ct)
+        {
+            const int bufferSize = 81920;
+            var buffer = new byte[bufferSize];
+
+            using var srcStream = new FileStream(src, FileMode.Open, FileAccess.Read,
+                FileShare.Read, bufferSize, useAsync: true);
+            using var dstStream = new FileStream(dst, FileMode.Create, FileAccess.Write,
+                FileShare.None, bufferSize, useAsync: true);
+
+            long copied = offsetBytes;
+            int read;
+            while ((read = await srcStream.ReadAsync(buffer, 0, bufferSize, ct)) > 0)
+            {
+                await dstStream.WriteAsync(buffer, 0, read, ct);
+                copied += read;
+                progress?.Report(new FileOperationProgress(copied, totalBytes));
+            }
+        }
+
+        private void TryCleanupPartial(string path)
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+                else if (Directory.Exists(path)) Directory.Delete(path, true);
+            }
+            catch { /* 忽略 */ }
         }
 
         public async Task<FileInfoModel> GetFileInfoAsync(string filePath)
@@ -769,6 +877,10 @@ namespace FileServer.Services
                 _logger.LogError(ex, "删除文件夹失败: {RelativePath}", relativePath);
                 return false;
             }
+        }
+        private class CopiedCounter
+        {
+            public long Value;
         }
     }
 }

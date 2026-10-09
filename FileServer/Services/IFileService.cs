@@ -28,14 +28,16 @@ namespace FileServer.Services
         /// </summary>
         Task<bool> RenameAsync(string oldPath, string newName);
 
-        /// <summary>
-        /// 移动文件或文件夹到新路径（可跨目录）
-        /// </summary>
-        Task<bool> MoveAsync(string sourcePath, string destPath);
+        // ===== 修改：Move/Copy 支持取消和进度 =====
+        Task<bool> MoveAsync(
+            string sourcePath,
+            string destPath,
+            CancellationToken cancellationToken = default);
 
-        /// <summary>
-        /// 复制文件或文件夹到新路径
-        /// </summary>
-        Task<bool> CopyAsync(string sourcePath, string destPath);
+        Task<bool> CopyAsync(
+            string sourcePath,
+            string destPath,
+            IProgress<FileOperationProgress> progress = null,
+            CancellationToken cancellationToken = default);
     }
 }

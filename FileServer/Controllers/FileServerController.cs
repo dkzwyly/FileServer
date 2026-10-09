@@ -808,7 +808,13 @@ namespace FileServer.Controllers
                 var col = db.GetCollection<FileOperationJob>("jobs");
                 col.Insert(job);
 
-                _jobQueue.Enqueue(job);
+                // ===== 修改：检查 Enqueue 返回值 =====
+                if (!_jobQueue.Enqueue(job))
+                {
+                    col.Delete(job.Id);
+                    _logger.LogError("移动任务入队失败: {JobId}", job.Id);
+                    return StatusCode(500, new { error = "任务队列不可用，请稍后重试" });
+                }
 
                 _logger.LogInformation("移动任务已入队: {JobId}, {Src} -> {Dst}", job.Id, sourcePath, destPath);
 
@@ -859,7 +865,12 @@ namespace FileServer.Controllers
                 var col = db.GetCollection<FileOperationJob>("jobs");
                 col.Insert(job);
 
-                _jobQueue.Enqueue(job);
+                if (!_jobQueue.Enqueue(job))
+                {
+                    col.Delete(job.Id);
+                    _logger.LogError("复制任务入队失败: {JobId}", job.Id);
+                    return StatusCode(500, new { error = "任务队列不可用，请稍后重试" });
+                }
 
                 _logger.LogInformation("复制任务已入队: {JobId}, {Src} -> {Dst}", job.Id, sourcePath, destPath);
 
@@ -874,6 +885,37 @@ namespace FileServer.Controllers
             {
                 _logger.LogError(ex, "复制任务入队失败");
                 return StatusCode(500, new { error = "入队失败", message = ex.Message });
+            }
+        }
+
+        // ===== 新增：取消任务 =====
+        [HttpPost("task/{taskId}/cancel")]
+        public IActionResult CancelTask(Guid taskId)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+
+                using var db = new LiteDatabase(_jobsConnectionString);
+                var col = db.GetCollection<FileOperationJob>("jobs");
+                var job = col.FindById(taskId);
+
+                if (job == null)
+                    return NotFound(new { error = "任务不存在" });
+
+                if (job.Status == "Completed" || job.Status == "Failed" || job.Status == "Cancelled")
+                    return BadRequest(new { error = $"任务已结束，当前状态: {job.Status}" });
+
+                job.CancelRequested = true;
+                col.Update(job);
+
+                _logger.LogInformation("任务取消已请求: {JobId}", taskId);
+                return Ok(new { success = true, message = "取消请求已提交" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "取消任务失败: {TaskId}", taskId);
+                return StatusCode(500, new { error = "取消失败", message = ex.Message });
             }
         }
 
@@ -898,7 +940,12 @@ namespace FileServer.Controllers
                     progressPercent = job.ProgressPercent,
                     errorMessage = job.ErrorMessage,
                     queueTime = job.QueueTime,
-                    completeTime = job.CompleteTime
+                    completeTime = job.CompleteTime,
+                    // ===== 新增字段 =====
+                    retryCount = job.RetryCount,
+                    cancelRequested = job.CancelRequested,
+                    totalBytes = job.TotalBytes,
+                    copiedBytes = job.CopiedBytes
                 });
             }
             catch (Exception ex)

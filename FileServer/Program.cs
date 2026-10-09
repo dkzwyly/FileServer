@@ -26,6 +26,9 @@ builder.Services.AddSingleton<ILyricsMappingService, LyricsMappingService>();
 builder.Services.AddSingleton<IFileTreeCacheService, FileTreeCacheService>();  // 依赖 IFileSystemHelper，无循环
 // 注册队列（单例）
 builder.Services.AddSingleton<IJobQueue, JobQueue>();
+// 新增：注册 JobWorker 配置
+builder.Services.Configure<JobWorkerOptions>(
+builder.Configuration.GetSection("FileServerConfig:JobWorker"));
 builder.Services.AddScoped<ITrashService, TrashService>();
 
 // 注册后台服务（托管）
