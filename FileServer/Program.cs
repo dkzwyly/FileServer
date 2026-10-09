@@ -33,6 +33,7 @@ builder.Services.AddScoped<ITrashService, TrashService>();
 
 // 注册后台服务（托管）
 builder.Services.AddHostedService<FileOperationBackgroundService>();
+builder.Services.AddHostedService<UdpDiscoveryService>();
 
 // 4. 注册后台托管服务
 builder.Services.AddHostedService<FileTreeSaveService>();        // 每日5点增量同步
