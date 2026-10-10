@@ -433,15 +433,44 @@ namespace FileServer.Services
             catch (OperationCanceledException)
             {
                 _logger.LogWarning("移动已取消: {Src} -> {Dst}", sourcePath, destPath);
+                TryCleanupPartial(dstFull);                              // ← 新增：跨分区回退时可能残留
+                await InvalidateTreeCacheForPathAsync(dstFull, root);    // ← 新增
                 throw;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "移动失败: {Src} -> {Dst}", sourcePath, destPath);
+                TryCleanupPartial(dstFull);                              // ← 新增
+                await InvalidateTreeCacheForPathAsync(dstFull, root);    // ← 新增
                 throw;
             }
         }
+        /// <summary>
+        /// 失效目标路径的树缓存。
+        /// 用于 Copy/Move 失败或取消后的清理——此时磁盘上可能已经没有目标，
+        /// 但缓存里可能已经被扫描进了部分节点。
+        /// </summary>
+        private async Task InvalidateTreeCacheForPathAsync(string fullPath, string root)
+        {
+            try
+            {
+                var relative = Path.GetRelativePath(root, fullPath).Replace("\\", "/");
+                if (string.IsNullOrEmpty(relative) || relative == ".") return;
 
+                // 移除该节点（目录会递归移除子树）
+                await _treeCache.RemoveNodeAsync(relative);
+
+                // 刷新父目录（如果父目录已经被扫进来，也要更新它的子节点列表）
+                var parent = Path.GetDirectoryName(relative)?.Replace("\\", "/") ?? "";
+                await _treeCache.GetDirectoryContentAsync(parent);
+
+                _logger.LogInformation("已失效树缓存: {Path}", relative);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "失效树缓存失败: {Path}", fullPath);
+            }
+        }
         public async Task<bool> CopyAsync(
             string sourcePath,
             string destPath,
@@ -494,14 +523,15 @@ namespace FileServer.Services
             catch (OperationCanceledException)
             {
                 _logger.LogWarning("复制已取消: {Src} -> {Dst}", sourcePath, destPath);
-                // 尽力清理已复制一半的目标
                 TryCleanupPartial(dstFull);
+                await InvalidateTreeCacheForPathAsync(dstFull, root);   // ← 新增
                 throw;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "复制失败: {Src} -> {Dst}", sourcePath, destPath);
                 TryCleanupPartial(dstFull);
+                await InvalidateTreeCacheForPathAsync(dstFull, root);   // ← 新增
                 throw;
             }
         }
