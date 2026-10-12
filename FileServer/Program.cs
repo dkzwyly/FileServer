@@ -12,6 +12,8 @@ builder.Services.Configure<FileServerConfig>(
 
 // 2. 新增：文件系统帮助器（打破循环依赖）
 builder.Services.AddSingleton<IFileSystemHelper, FileSystemHelper>();
+// 放在 IFileSystemHelper 之后
+builder.Services.AddSingleton<ILiteDbProvider, LiteDbProvider>();
 
 // 3. 注册核心服务（所有服务统一为 Singleton）
 builder.Services.AddSingleton<IThumbnailService, ThumbnailService>();
@@ -29,7 +31,7 @@ builder.Services.AddSingleton<IJobQueue, JobQueue>();
 // 新增：注册 JobWorker 配置
 builder.Services.Configure<JobWorkerOptions>(
 builder.Configuration.GetSection("FileServerConfig:JobWorker"));
-builder.Services.AddScoped<ITrashService, TrashService>();
+builder.Services.AddSingleton<ITrashService, TrashService>();
 
 // 注册后台服务（托管）
 builder.Services.AddHostedService<FileOperationBackgroundService>();

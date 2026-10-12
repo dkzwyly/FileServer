@@ -23,7 +23,10 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
     // 辅助映射：指纹 -> 路径
     private static readonly ConcurrentDictionary<string, string> _fingerprintToPath = new();
 
-    public AudioMetadataService(ILogger<AudioMetadataService> logger, IConfiguration configuration)
+    public AudioMetadataService(
+    ILogger<AudioMetadataService> logger,
+    IConfiguration configuration,
+    ILiteDbProvider dbProvider)         // 新增
     {
         _logger = logger;
 
@@ -37,24 +40,13 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
             Directory.CreateDirectory(_coversDirectory);
 
         var dbPath = configuration["FileServerConfig:AudioLiteDbPath"];
-        if (string.IsNullOrEmpty(dbPath))
-            dbPath = Path.Combine(_rootPath, "audio-metadata.db");
-        else
-            dbPath = Path.GetFullPath(Path.Combine(_rootPath, dbPath));
-
-        var dbDir = Path.GetDirectoryName(dbPath);
-        if (!string.IsNullOrEmpty(dbDir) && !Directory.Exists(dbDir))
-            Directory.CreateDirectory(dbDir);
-
-        _db = new LiteDatabase(dbPath);
+        _db = dbProvider.GetDatabase("audio-metadata", dbPath);
         _collection = _db.GetCollection<SongMetadata>("songMetadata");
-        // 以 Fingerprint 作为唯一索引
         _collection.EnsureIndex(x => x.Fingerprint, unique: true);
-        // 保留 FilePath 索引用于搜索
         _collection.EnsureIndex(x => x.FilePath);
 
         LoadFromDatabase();
-        _logger.LogInformation("AudioMetadataService 初始化完成，数据库路径: {DbPath}", dbPath);
+        _logger.LogInformation("AudioMetadataService 初始化完成（数据库由 ILiteDbProvider 管理）");
     }
 
     private void LoadFromDatabase()
@@ -570,6 +562,7 @@ public class AudioMetadataService : IAudioMetadataService, IDisposable
 
     public void Dispose()
     {
-        _db?.Dispose();
+        // 数据库由 ILiteDbProvider 统一释放，这里只做必要的收尾
+        // 如需保留空实现也可以
     }
 }

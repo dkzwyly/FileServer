@@ -38,6 +38,7 @@ namespace FileServer.Services
         /// 如果树缓存中该目录不存在或已过期，会触发增量扫描（访问磁盘）来修复缓存。
         /// </summary>
         Task<List<string>> GetAllFilePathsAsync(string relativePath);
+        Task ForceRefreshDirectoryAsync(string relativePath, bool recursive = false);
 
     }
 }

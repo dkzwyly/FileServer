@@ -32,7 +32,12 @@ namespace FileServer.Services
             ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".webp", ".heic", ".heif", ".gif"
         };
 
-        public PhotoMetadataService(IFileService fileService, ILogger<PhotoMetadataService> logger, IFileTreeCacheService fileTreeCacheService, IConfiguration configuration)
+        public PhotoMetadataService(
+    IFileService fileService,
+    ILogger<PhotoMetadataService> logger,
+    IFileTreeCacheService fileTreeCacheService,
+    IConfiguration configuration,
+    ILiteDbProvider dbProvider)         // 新增
         {
             _logger = logger;
             _fileTreeCacheService = fileTreeCacheService;
@@ -42,27 +47,16 @@ namespace FileServer.Services
             _rootPath = Path.GetFullPath(rawRoot);
 
             var dbPath = configuration["FileServerConfig:PhotoLiteDbPath"];
-            if (string.IsNullOrEmpty(dbPath))
-                dbPath = Path.Combine(_rootPath, "photo-metadata.db");
-            else
-                dbPath = Path.GetFullPath(Path.Combine(_rootPath, dbPath));
-
-            var dbDir = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(dbDir) && !Dir.Exists(dbDir))
-                Dir.CreateDirectory(dbDir);
-
-            _db = new LiteDatabase(dbPath);
+            _db = dbProvider.GetDatabase("photo-metadata", dbPath);
             _collection = _db.GetCollection<PhotoMetadata>("photoMetadata");
-            // 以 Fingerprint 作为唯一索引
             _collection.EnsureIndex(x => x.Fingerprint, unique: true);
-            // 保留 RelativePath 索引用于搜索
             _collection.EnsureIndex(x => x.RelativePath);
             _collection.EnsureIndex(x => x.DateTaken);
             _collection.EnsureIndex(x => x.Latitude);
             _collection.EnsureIndex(x => x.Longitude);
 
             LoadFromDatabase();
-            _logger.LogInformation("PhotoMetadataService 初始化完成，数据库路径: {DbPath}", dbPath);
+            _logger.LogInformation("PhotoMetadataService 初始化完成（数据库由 ILiteDbProvider 管理）");
         }
 
         private void LoadFromDatabase()
@@ -622,7 +616,7 @@ namespace FileServer.Services
 
         public void Dispose()
         {
-            _db?.Dispose();
+            // 数据库由 ILiteDbProvider 统一释放
         }
     }
 }

@@ -9,6 +9,56 @@ namespace FileServer.Services
     {
         private readonly string _rootPath;
 
+        // ★ 新增：类级别的静态只读字典，整个进程共享一份
+        // 用 OrdinalIgnoreCase 保持原来不区分大小写的行为
+        private static readonly Dictionary<string, string> _mimeTypes
+            = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { ".txt", "text/plain" },
+            { ".html", "text/html" },
+            { ".htm", "text/html" },
+            { ".css", "text/css" },
+            { ".js", "application/javascript" },
+            { ".json", "application/json" },
+            { ".xml", "application/xml" },
+            { ".jpg", "image/jpeg" },
+            { ".jpeg", "image/jpeg" },
+            { ".png", "image/png" },
+            { ".gif", "image/gif" },
+            { ".bmp", "image/bmp" },
+            { ".webp", "image/webp" },
+            { ".mp3", "audio/mpeg" },
+            { ".wav", "audio/wav" },
+            { ".flac", "audio/flac" },
+            { ".aac", "audio/aac" },
+            { ".ogg", "audio/ogg" },
+            { ".mp4", "video/mp4" },
+            { ".avi", "video/x-msvideo" },
+            { ".mov", "video/quicktime" },
+            { ".mkv", "video/x-matroska" },
+            { ".wmv", "video/x-ms-wmv" },
+            { ".flv", "video/x-flv" },
+            { ".webm", "video/webm" },
+            { ".m4v", "video/mp4" },
+            { ".pdf", "application/pdf" },
+            { ".zip", "application/zip" },
+            { ".rar", "application/x-rar-compressed" },
+            { ".7z", "application/x-7z-compressed" },
+            { ".doc", "application/msword" },
+            { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+            { ".xls", "application/vnd.ms-excel" },
+            { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+            { ".ppt", "application/vnd.ms-powerpoint" },
+            { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
+            { ".md", "text/markdown" },
+            { ".csv", "text/csv" },
+            { ".yml", "text/yaml" },
+            { ".yaml", "text/yaml" },
+            { ".ini", "text/plain" },
+            { ".config", "text/xml" },
+            { ".sql", "application/sql" }
+        };
+
         public FileSystemHelper(IConfiguration configuration)
         {
             _rootPath = configuration["FileServerConfig:RootPath"]
@@ -33,56 +83,10 @@ namespace FileServer.Services
             return $"{len:0.##} {sizes[order]}";
         }
 
+        // ★ 改后：不再 new，直接从共享字典查
         public string GetMimeType(string extension)
         {
-            var mimeTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            {
-                { ".txt", "text/plain" },
-                { ".html", "text/html" },
-                { ".htm", "text/html" },
-                { ".css", "text/css" },
-                { ".js", "application/javascript" },
-                { ".json", "application/json" },
-                { ".xml", "application/xml" },
-                { ".jpg", "image/jpeg" },
-                { ".jpeg", "image/jpeg" },
-                { ".png", "image/png" },
-                { ".gif", "image/gif" },
-                { ".bmp", "image/bmp" },
-                { ".webp", "image/webp" },
-                { ".mp3", "audio/mpeg" },
-                { ".wav", "audio/wav" },
-                { ".flac", "audio/flac" },
-                { ".aac", "audio/aac" },
-                { ".ogg", "audio/ogg" },
-                { ".mp4", "video/mp4" },
-                { ".avi", "video/x-msvideo" },
-                { ".mov", "video/quicktime" },
-                { ".mkv", "video/x-matroska" },
-                { ".wmv", "video/x-ms-wmv" },
-                { ".flv", "video/x-flv" },
-                { ".webm", "video/webm" },
-                { ".m4v", "video/mp4" },
-                { ".pdf", "application/pdf" },
-                { ".zip", "application/zip" },
-                { ".rar", "application/x-rar-compressed" },
-                { ".7z", "application/x-7z-compressed" },
-                { ".doc", "application/msword" },
-                { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
-                { ".xls", "application/vnd.ms-excel" },
-                { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
-                { ".ppt", "application/vnd.ms-powerpoint" },
-                { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" },
-                { ".md", "text/markdown" },
-                { ".csv", "text/csv" },
-                { ".yml", "text/yaml" },
-                { ".yaml", "text/yaml" },
-                { ".ini", "text/plain" },
-                { ".config", "text/xml" },
-                { ".sql", "application/sql" }
-            };
-
-            return mimeTypes.TryGetValue(extension, out string mimeType)
+            return _mimeTypes.TryGetValue(extension, out string mimeType)
                 ? mimeType
                 : "application/octet-stream";
         }

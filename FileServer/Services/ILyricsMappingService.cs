@@ -4,8 +4,8 @@ namespace FileServer.Services
 {
     public interface ILyricsMappingService
     {
-        /// <summary>按指纹保存或更新歌词映射</summary>
-        Task<bool> SaveMappingAsync(string fingerprint, string lyricsPath);
+        /// <summary>按路径，内部指纹保存或更新歌词映射</summary>
+        Task<bool> SaveMappingAsync(string songPath, string lyricsPath);
 
         /// <summary>按指纹获取歌词路径</summary>
         Task<string?> GetMappingByFingerprintAsync(string fingerprint);

@@ -19,15 +19,16 @@ namespace FileServer.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly ILogger<FileOperationBackgroundService> _logger;
         private readonly JobWorkerOptions _options;
-        private readonly string _connectionString;
+        private readonly LiteDatabase _db;
 
         public FileOperationBackgroundService(
-            IJobQueue jobQueue,
-            IServiceProvider serviceProvider,
-            ILogger<FileOperationBackgroundService> logger,
-            IConfiguration configuration,
-            IOptions<JobWorkerOptions> options,
-            IFileSystemHelper fileSystemHelper)
+    IJobQueue jobQueue,
+    IServiceProvider serviceProvider,
+    ILogger<FileOperationBackgroundService> logger,
+    IConfiguration configuration,
+    IOptions<JobWorkerOptions> options,
+    IFileSystemHelper fileSystemHelper,
+    ILiteDbProvider dbProvider)         // 新增
         {
             _jobQueue = jobQueue;
             _serviceProvider = serviceProvider;
@@ -39,8 +40,8 @@ namespace FileServer.Services
             var fullMetadataDir = Path.Combine(rootPath, metadataDir);
             if (!Directory.Exists(fullMetadataDir))
                 Directory.CreateDirectory(fullMetadataDir);
-            var dbPath = Path.Combine(fullMetadataDir, "file-jobs.db");
-            _connectionString = $"Filename={dbPath};Connection=Shared";
+
+            _db = dbProvider.GetDatabase("file-jobs");
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -94,33 +95,25 @@ namespace FileServer.Services
             try
             {
                 List<FileOperationJob> pending;
-                using (var db = new LiteDatabase(_connectionString))
+                // 原来：using (var db = new LiteDatabase(_connectionString))
+                var col = _db.GetCollection<FileOperationJob>("jobs");
+
+                pending = col.Find(j => j.Status == "Queued" || j.Status == "Processing").ToList();
+
+                foreach (var job in pending.Where(j => j.Status == "Processing"))
                 {
-                    var col = db.GetCollection<FileOperationJob>("jobs");
-
-                    // Queued 和 Processing 都需要恢复
-                    pending = col.Find(j => j.Status == "Queued" || j.Status == "Processing").ToList();
-
-                    // Processing 说明上次跑到一半崩了，改回 Queued
-                    foreach (var job in pending.Where(j => j.Status == "Processing"))
-                    {
-                        job.Status = "Queued";
-                        job.ErrorMessage = "服务重启，任务重新排队";
-                        col.Update(job);
-                    }
+                    job.Status = "Queued";
+                    job.ErrorMessage = "服务重启，任务重新排队";
+                    col.Update(job);
                 }
 
                 foreach (var job in pending)
                 {
                     if (!_jobQueue.Enqueue(job))
-                    {
                         _logger.LogError("恢复任务入队失败: {JobId}", job.Id);
-                    }
                     else
-                    {
                         _logger.LogWarning("恢复未完成的任务: {JobId} ({Op}) {Src} -> {Dst}",
                             job.Id, job.OperationType, job.SourcePath, job.DestPath);
-                    }
                 }
 
                 _logger.LogInformation("任务恢复完成，共 {Count} 个", pending.Count);
@@ -138,8 +131,8 @@ namespace FileServer.Services
             // ---- 1. 更新状态为 Processing ----
             try
             {
-                using var db = new LiteDatabase(_connectionString);
-                var col = db.GetCollection<FileOperationJob>("jobs");
+                // 原来：using var db = new LiteDatabase(_connectionString);
+                var col = _db.GetCollection<FileOperationJob>("jobs");
                 var current = col.FindById(job.Id);
                 if (current == null)
                 {
@@ -171,8 +164,8 @@ namespace FileServer.Services
                         || percent == 100)
                     {
                         lastWrittenPercent = percent;
-                        using var db = new LiteDatabase(_connectionString);
-                        var col = db.GetCollection<FileOperationJob>("jobs");
+                        // 原来：using var db = new LiteDatabase(_connectionString);
+                        var col = _db.GetCollection<FileOperationJob>("jobs");
                         var cur = col.FindById(job.Id);
                         if (cur != null)
                         {
@@ -234,8 +227,8 @@ namespace FileServer.Services
             // ---- 5. 写最终状态 / 重试 ----
             try
             {
-                using var db = new LiteDatabase(_connectionString);
-                var col = db.GetCollection<FileOperationJob>("jobs");
+                // 原来：using var db = new LiteDatabase(_connectionString);
+                var col = _db.GetCollection<FileOperationJob>("jobs");
                 var current = col.FindById(job.Id);
                 if (current == null)
                 {
@@ -259,7 +252,6 @@ namespace FileServer.Services
                     current.CompleteTime = DateTime.UtcNow;
                     col.Update(current);
 
-                    // 刷新树缓存（尽力而为）
                     try
                     {
                         using var scope = _serviceProvider.CreateScope();
@@ -278,7 +270,6 @@ namespace FileServer.Services
                 }
                 else
                 {
-                    // 重试判断
                     if (current.RetryCount < _options.MaxRetryCount)
                     {
                         current.RetryCount++;
@@ -329,8 +320,8 @@ namespace FileServer.Services
                     {
                         await Task.Delay(_options.CancelCheckIntervalMs, inner.Token);
 
-                        using var db = new LiteDatabase(_connectionString);
-                        var col = db.GetCollection<FileOperationJob>("jobs");
+                        // 原来：using var db = new LiteDatabase(_connectionString);
+                        var col = _db.GetCollection<FileOperationJob>("jobs");
                         var j = col.FindById(jobId);
                         if (j == null) break;
                         if (j.Status == "Completed" || j.Status == "Failed" || j.Status == "Cancelled") break;

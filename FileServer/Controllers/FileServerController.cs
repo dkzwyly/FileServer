@@ -34,6 +34,7 @@ namespace FileServer.Controllers
         private readonly IFileSystemHelper _fileSystemHelper;
         private readonly string _jobsDbPath;
         private readonly string _jobsConnectionString;
+        private readonly IFileTreeCacheService _fileTreeCacheService;
 
 
         public FileServerController(
@@ -50,7 +51,8 @@ namespace FileServer.Controllers
         ILyricsMappingService lyricsMappingService,
         IJobQueue jobQueue,
         ITrashService trashService,// 新增
-        IFileSystemHelper fileSystemHelper)    // 新增
+      IFileSystemHelper fileSystemHelper,
+    IFileTreeCacheService fileTreeCacheService)
         {
             _fileService = fileService;
             _statusService = statusService;
@@ -65,6 +67,7 @@ namespace FileServer.Controllers
             _charactersPerPage = configuration.GetValue<int>("Preview:CharactersPerPage", 5000);
             _trashService = trashService;
             _memoryCache = memoryCache;
+            _fileTreeCacheService = fileTreeCacheService;
 
             // 新增赋值
             _jobQueue = jobQueue;
@@ -121,18 +124,33 @@ namespace FileServer.Controllers
         }
 
         [HttpGet("list/{*path}")]
-        public async Task<IActionResult> GetFileList(string path = "", [FromQuery] string sortBy = "name", [FromQuery] string sortOrder = "asc")
+        public async Task<IActionResult> GetFileList(
+    string path = "",
+    [FromQuery] string sortBy = "name",
+    [FromQuery] string sortOrder = "asc",
+    [FromQuery] bool forceRefresh = false)   // ← 新增：强制刷新缓存
         {
             try
             {
                 _statusService.IncrementRequests();
+
+                // 强制刷新缓存后再取列表
+                if (forceRefresh)
+                {
+                    path = WebUtility.UrlDecode(path ?? "");
+                    await _fileTreeCacheService.ForceRefreshDirectoryAsync(path, recursive: false);
+                }
+
                 var result = await _fileService.GetFileListAsync(path);
 
                 // 按拍摄时间排序（仅对图片文件有效）
                 if (sortBy.Equals("dateTaken", StringComparison.OrdinalIgnoreCase))
                 {
                     // 仅对图片文件附加元数据
-                    var imageFiles = result.Files.Where(f => IsImageFile(Path.GetExtension(f.Name))).ToList();
+                    var imageFiles = result.Files
+                        .Where(f => IsImageFile(Path.GetExtension(f.Name)))
+                        .ToList();
+
                     if (imageFiles.Any())
                     {
                         var paths = imageFiles.Select(f => f.Path);
@@ -186,6 +204,26 @@ namespace FileServer.Controllers
                 return StatusCode(500, new { error = "服务器内部错误", message = ex.Message });
             }
         }
+
+        [HttpPost("tree/refresh")]
+        public async Task<IActionResult> RefreshTreeCache(
+    [FromQuery] string? path = "",
+    [FromQuery] bool recursive = false)
+        {
+            try
+            {
+                _statusService.IncrementRequests();
+                var normalized = WebUtility.UrlDecode(path ?? "");
+                await _fileTreeCacheService.ForceRefreshDirectoryAsync(normalized, recursive);
+                return Ok(new { success = true, path = normalized, recursive });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "刷新目录缓存失败: {Path}", path);
+                return StatusCode(500, new { error = "刷新失败", message = ex.Message });
+            }
+        }
+
         // 搜索照片（支持按日期、GPS、分页、排序）
         [HttpGet("photo-metadata/search")]
         public async Task<IActionResult> SearchPhotos(
@@ -1925,7 +1963,6 @@ namespace FileServer.Controllers
 
                 if (bestLyricsMatch != null && bestLyricsMatch.LyricsFile != null)
                 {
-                    // 找到匹配，自动保存映射（使用指纹）
                     await _lyricsMappingService.SaveMappingAsync(fingerprint, bestLyricsMatch.LyricsFile.Path);
 
                     _logger.LogInformation("智能匹配成功并建立映射: {SongPath} -> {LyricsPath}, 分数: {Score}",

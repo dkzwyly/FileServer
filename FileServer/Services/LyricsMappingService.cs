@@ -13,62 +13,71 @@ namespace FileServer.Services
         private readonly IAudioMetadataService _audioMetadataService;
         private readonly LiteDatabase _db;
         private readonly ILiteCollection<LyricsMappingRecord> _collection;
+        private readonly string _rootPath;
 
         public LyricsMappingService(
-            ILogger<LyricsMappingService> logger,
-            IConfiguration configuration,
-            IAudioMetadataService audioMetadataService)
+    ILogger<LyricsMappingService> logger,
+    IConfiguration configuration,
+    IAudioMetadataService audioMetadataService,
+    ILiteDbProvider dbProvider)         // 新增
         {
             _logger = logger;
             _audioMetadataService = audioMetadataService;
 
             var rootPath = configuration["FileServerConfig:RootPath"]
                 ?? throw new InvalidOperationException("未配置 FileServerConfig:RootPath");
-            rootPath = Path.GetFullPath(rootPath);
+            _rootPath = Path.GetFullPath(rootPath);
 
             var dbPath = configuration["FileServerConfig:LyricsLiteDbPath"];
-            if (string.IsNullOrEmpty(dbPath))
-                dbPath = Path.Combine(rootPath, "lyrics-mappings.db");
-            else
-                dbPath = Path.GetFullPath(Path.Combine(rootPath, dbPath));
-
-            var dbDir = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(dbDir) && !Directory.Exists(dbDir))
-                Directory.CreateDirectory(dbDir);
-
-            _db = new LiteDatabase(dbPath);
+            _db = dbProvider.GetDatabase("lyrics-mappings", dbPath);
             _collection = _db.GetCollection<LyricsMappingRecord>("lyricsMappings");
             _collection.EnsureIndex(x => x.Fingerprint, unique: true);
-            _collection.EnsureIndex(x => x.FilePath); // 非唯一索引，用于按路径查询
+            _collection.EnsureIndex(x => x.FilePath);
 
-            _logger.LogInformation("LyricsMappingService 初始化完成，数据库路径: {DbPath}", dbPath);
+            _logger.LogInformation("LyricsMappingService 初始化完成（数据库由 ILiteDbProvider 管理）");
         }
 
-        public async Task<bool> SaveMappingAsync(string fingerprint, string lyricsPath)
+        public async Task<bool> SaveMappingAsync(string songPath, string lyricsPath)
         {
             try
             {
-                // 通过指纹从音频元数据服务获取路径（用于存储 FilePath）
-                var audioMeta = await _audioMetadataService.GetMetadataByFingerprintAsync(fingerprint);
-                var filePath = audioMeta?.FilePath ?? string.Empty;
+                var meta = await _audioMetadataService.GetMetadataAsync(ToFullPath(songPath));
+                if (meta == null || string.IsNullOrEmpty(meta.Fingerprint))
+                {
+                    _logger.LogWarning("无法获取歌曲指纹，映射保存失败: {SongPath}", songPath);
+                    return false;
+                }
 
                 var record = new LyricsMappingRecord
                 {
-                    Fingerprint = fingerprint,
-                    FilePath = filePath,
+                    Fingerprint = meta.Fingerprint,
+                    FilePath = songPath,
                     LyricsPath = lyricsPath
                 };
                 _collection.Upsert(record);
-                _logger.LogDebug("歌词映射已保存: {Fingerprint} -> {LyricsPath}", fingerprint, lyricsPath);
+                _logger.LogDebug("歌词映射已保存: {Fingerprint} -> {LyricsPath}", meta.Fingerprint, lyricsPath);
                 return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "保存歌词映射失败: {Fingerprint}", fingerprint);
+                _logger.LogError(ex, "保存歌词映射失败: {SongPath}", songPath);
                 return false;
             }
         }
+        /// <summary>
+        /// 把相对路径（如 data/音乐/xxx.flac）拼成完整物理路径。
+        /// IAudioMetadataService.GetMetadataAsync 需要完整路径。
+        /// 如果传入的已经是绝对路径，则原样返回。
+        /// </summary>
+        private string ToFullPath(string songPath)
+        {
+            if (string.IsNullOrEmpty(songPath))
+                return songPath;
 
+            return Path.IsPathRooted(songPath)
+                ? songPath
+                : Path.Combine(_rootPath, songPath);
+        }
         public async Task<string?> GetMappingByFingerprintAsync(string fingerprint)
         {
             try
@@ -87,10 +96,10 @@ namespace FileServer.Services
         {
             try
             {
-                // 先通过音频元数据服务获取指纹
-                var meta = await _audioMetadataService.GetMetadataAsync(songPath);
+                var meta = await _audioMetadataService.GetMetadataAsync(ToFullPath(songPath));
                 if (meta == null || string.IsNullOrEmpty(meta.Fingerprint))
                     return null;
+
                 return await GetMappingByFingerprintAsync(meta.Fingerprint);
             }
             catch (Exception ex)
@@ -118,15 +127,24 @@ namespace FileServer.Services
 
         public async Task<bool> DeleteMappingByPathAsync(string songPath)
         {
-            var meta = await _audioMetadataService.GetMetadataAsync(songPath);
-            if (meta == null || string.IsNullOrEmpty(meta.Fingerprint))
+            try
+            {
+                var meta = await _audioMetadataService.GetMetadataAsync(ToFullPath(songPath));
+                if (meta == null || string.IsNullOrEmpty(meta.Fingerprint))
+                    return false;
+
+                return await DeleteMappingByFingerprintAsync(meta.Fingerprint);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "按路径删除歌词映射失败: {SongPath}", songPath);
                 return false;
-            return await DeleteMappingByFingerprintAsync(meta.Fingerprint);
+            }
         }
 
         public void Dispose()
         {
-            _db?.Dispose();
+            // 数据库由 ILiteDbProvider 统一释放
         }
 
         private class LyricsMappingRecord

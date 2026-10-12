@@ -22,17 +22,17 @@ namespace FileServer.Services
         private readonly string _trashRoot;
 
         public TrashService(
-            IFileSystemHelper fileSystemHelper,
-            IPhotoMetadataService photoMetadataService,
-            IAudioMetadataService audioMetadataService,
-            IFileTreeCacheService treeCache,                 // 新增
-            ILogger<TrashService> logger,
-            IConfiguration configuration)
+    IFileSystemHelper fileSystemHelper,
+    IPhotoMetadataService photoMetadataService,
+    IAudioMetadataService audioMetadataService,
+    IFileTreeCacheService treeCache,
+    ILogger<TrashService> logger,
+    ILiteDbProvider dbProvider)         // 替换 IConfiguration
         {
             _fileSystemHelper = fileSystemHelper;
             _photoMetadataService = photoMetadataService;
             _audioMetadataService = audioMetadataService;
-            _treeCache = treeCache;                          // 新增
+            _treeCache = treeCache;
             _logger = logger;
 
             var rootPath = _fileSystemHelper.GetRootPath();
@@ -40,13 +40,7 @@ namespace FileServer.Services
             if (!Directory.Exists(_trashRoot))
                 Directory.CreateDirectory(_trashRoot);
 
-            var metadataDir = configuration["FileServerConfig:MetadataDirectory"] ?? "系统文件";
-            var fullMetadataDir = Path.Combine(rootPath, metadataDir);
-            if (!Directory.Exists(fullMetadataDir))
-                Directory.CreateDirectory(fullMetadataDir);
-
-            var dbPath = Path.Combine(fullMetadataDir, "trash.db");
-            _db = new LiteDatabase($"Filename={dbPath};Connection=Shared");
+            _db = dbProvider.GetDatabase("trash");
             _collection = _db.GetCollection<TrashRecord>("trash");
             _collection.EnsureIndex(x => x.OriginalPath);
             _collection.EnsureIndex(x => x.DeletedTime);
